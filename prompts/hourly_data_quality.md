@@ -7,8 +7,10 @@ and the schedule definition that runs it.
 - Input: an append-only `orders` event table that lands every hour as Parquet
   under a path or S3/GCS prefix, partitioned by event date and hour. Columns:
   order_id, customer_id, event_ts, amount, currency, country, status,
-  payment_method. It is billions of rows a day, so the job has to scale past
-  one machine, and the schema can drift without warning.
+  payment_method. The schema can drift without warning.
+- Scale: billions of rows (several TB of Parquet) a day, with weeks of history
+  behind the baselines, and each hourly run has to finish well inside its hour.
+  Don't assume any step fits on one machine.
 - Each run checks the latest completed hour (and can backfill any given hour)
   for: freshness / missing or late partitions, row-count anomalies vs the same
   hour in prior weeks, null and duplicate-key rates, schema drift,

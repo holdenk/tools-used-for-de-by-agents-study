@@ -6,6 +6,9 @@ boxes, running in parallel on a cluster.
 
 - Input: Mapbox POI records (GeoJSON / Parquet / CSV, point or polygon
   geometry). Support a path or S3/GCS prefix, so it scales past one machine.
+- Scale: hundreds of millions of POIs (on the order of 1 TB), heavily skewed
+  toward dense cities, and a full rebuild has to finish in a few hours on a
+  cluster. Don't assume any step fits on one machine.
 - Output: one row per POI with poi id, the S2 cell covering of its bounding box
   (cell ids as tokens, configurable min/max level and max cells), written
   partitioned by a coarse S2 cell so downstream spatial joins are cheap.

@@ -6,8 +6,11 @@ Create a streaming job that looks for credit card fraud in real time.
 - Input: a stream of card authorization events (JSON on a Kafka topic or
   similar) with txn_id, card_id, merchant_id, mcc, amount, currency, event_ts,
   lat/lon, country, card_present, device_id. Events arrive out of order and
-  late, at tens of thousands per second at peak, so the job has to scale
-  horizontally.
+  late.
+- Scale: tens of thousands of events per second at peak (billions a day)
+  across hundreds of millions of cards, so per-card state alone won't fit on
+  one machine, and the scored-transaction sink grows by terabytes a month. The
+  job has to scale horizontally.
 - Flag transactions, with reason codes, for at least: velocity (too many
   authorizations per card in a short window), amount spikes vs the card's own
   history, impossible travel between consecutive transactions, card testing
