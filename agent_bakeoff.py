@@ -322,16 +322,20 @@ def language_name(text):
 def inspect_answer(ans):
     """(languages, libraries, tool_versions, pins) from an ask-style answer, using the same LIBS labels."""
     comps = [c for c in ans.get("components") or [] if isinstance(c, dict) and c.get("name")]
-    libs, tool_versions = set(), {}
-    for c in comps:
-        name, ver = str(c["name"]), str(c.get("version") or "").strip()
+    libs, candidates = set(), collections.defaultdict(list)
+    for i, c in enumerate(comps):
+        name = str(c["name"])
+        ver = re.match(r"v?(\d[\w.\-+]*)", str(c.get("version") or "").strip())  # skip "bundled with Spark"
         # code regexes catch `pyspark` / `confluent-kafka`; the bare label catches prose like "Apache Spark"
         hits = {label for rx, label in LIBS.items()
                 if re.search(rx, name, re.I) or re.search(rf"\b{re.escape(label)}\b", name, re.I)}
         libs |= hits
         for label in hits:
             if ver:
-                tool_versions.setdefault(label, ver)
+                candidates[label].append((len(hits), i, ver.group(1)))
+    # A component that hits several labels is usually a connector (spark-sql-kafka, flink-connector-kafka),
+    # so for each label prefer a component that hits only that label, then the first one listed.
+    tool_versions = {label: min(cs)[2] for label, cs in candidates.items()}
     langs = {language_name(str(l)): None for l in ans.get("languages") or []}
     pins = {str(c["name"]).lower(): str(c["version"]) for c in comps if c.get("version")}
     return langs, sorted(libs), tool_versions, pins
