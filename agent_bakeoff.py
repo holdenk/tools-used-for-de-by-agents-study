@@ -234,7 +234,12 @@ def pinned_versions(workdir):
             for rx in PINS:
                 for name, ver in re.findall(rx, text, re.M):
                     pins.setdefault(name.lower(), ver)
-    return pins
+    # Maven / Gradle deps often say ${flink.version}; resolve those from the <properties> pins
+    for name, ver in pins.items():
+        ref = re.fullmatch(r"\$\{([\w.\-]+)\}", ver.strip())
+        if ref:
+            pins[name] = pins.get(ref.group(1).lower(), ver)
+    return {k: v for k, v in pins.items() if not v.startswith("$")}
 
 
 def docs_text(workdir):
