@@ -27,6 +27,22 @@ Every task runs in two modes. The prompts are identical apart from one `Tooling:
 
 Both modes ask the agent to pin dependency versions.
 
+## Styles: build vs ask
+
+- **build** (default): the agent builds the whole thing, runs the tests, and we
+  inspect the code and dependency files it wrote. Slow and expensive, but it shows
+  what the agent actually does.
+- **ask** (`--style ask`): much cheaper. The agent gets the same task prompt, plus a
+  trailer telling it not to write anything and to reply with only JSON
+  (`languages`, `components: [{name, version, role}]`, `rationale`). That answer
+  goes through the same library and version detection, under an `ask-` variant
+  (`ask-float`, `ask-prefer-spark+kafka`). The report marks those columns `[ask]`.
+  What an agent says it would use and what it ends up using can differ, so
+  `--style both` lets you compare the two.
+
+Version caveat: for tools with a separate client library, the version recorded is
+usually the client's (e.g. `confluent-kafka 2.6.1` shows up as `Kafka 2.6.1`).
+
 ## Adding a task
 
 Drop in `prompts/<task>.md`; the file name is the task name. Put a `{tooling}` line
@@ -62,6 +78,13 @@ python3 agent_bakeoff.py --out bakeoff --mode prefer --tasks cc_fraud_streaming 
 ```bash
 python3 agent_bakeoff.py --out bakeoff --mode prefer --prefer Flink,Kafka --tasks cc_fraud_streaming
 ```
+
+```bash
+python3 agent_bakeoff.py --out bakeoff-ask --style ask --models claude:haiku,claude:sonnet
+```
+
+- `--models` takes Cursor model names plus `cortex` and `claude`. Use
+  `claude:<model>` (e.g. `claude:haiku`) to pick the Claude Code model.
 
 - `--mode float|prefer|both` (default both). `--prefer` overrides every selected
   task's `prefer:` header and gets its own variant (`prefer-flink+kafka`), so it
