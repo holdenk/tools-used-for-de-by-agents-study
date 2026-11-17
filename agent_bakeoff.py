@@ -134,7 +134,7 @@ LANGS = {".py": "Python", ".scala": "Scala", ".java": "Java", ".sql": "SQL", ".g
 # regex over source + dependency files -> label. One list for every task so labels compare across tasks.
 LIBS = {
     # compute engines
-    r"pyspark|org\.apache\.spark|spark-sql|spark-core": "Spark",
+    r"pyspark|org\.apache\.spark|spark-sql|spark-core|\bspark\s+sql\b": "Spark",
     r"\breadStream\b|\bwriteStream\b|spark-sql-kafka": "Spark Structured Streaming",
     r"apache_beam|org\.apache\.beam": "Beam",
     r"pyflink|org\.apache\.flink|\bflink\b": "Flink",
@@ -320,8 +320,11 @@ LANG_ALIASES = {**{v.lower(): v for v in LANGS.values()}, "bash": "Shell", "sh":
 
 
 def language_name(text):
-    """'Java 17 (Eclipse Temurin)' -> 'Java'; 'Bash scripts' -> 'Shell'; unknown -> its first word."""
-    if re.match(r"\s*(spark|hive|ansi)\s*sql", text, re.I):
+    """'Java 17 (Eclipse Temurin)' -> 'Java'; 'Bash scripts' -> 'Shell'; 'Spark SQL' -> 'Spark SQL';
+    unknown -> its first word."""
+    if re.match(r"\s*spark\s*sql", text, re.I):
+        return "Spark SQL"
+    if re.match(r"\s*(hive|ansi)\s*sql", text, re.I):
         return "SQL"
     word = (re.findall(r"[A-Za-z][\w+#]*", text) or [text])[0]
     return LANG_ALIASES.get(word.lower(), word)
@@ -345,8 +348,12 @@ def inspect_answer(ans):
     # so for each label prefer a component that hits only that label, then the first one listed.
     tool_versions = {label: min(cs)[2] for label, cs in candidates.items()}
     langs = {language_name(str(l)): None for l in ans.get("languages") or []}
+    # "Spark SQL", "SQL (Spark SQL)" or "Java (runtime for Spark)" as a language still means the stack uses Spark
+    if any(re.search(r"\bspark\b", str(l), re.I) for l in ans.get("languages") or []):
+        libs.add("Spark")
+    libs = sorted(libs)
     pins = {str(c["name"]).lower(): str(c["version"]) for c in comps if c.get("version")}
-    return langs, sorted(libs), tool_versions, pins
+    return langs, libs, tool_versions, pins
 
 
 def summarize(stream, workdir, style="build"):
