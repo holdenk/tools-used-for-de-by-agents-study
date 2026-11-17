@@ -1,35 +1,48 @@
 #!/usr/bin/env python3
-"""Compare two agent_bakeoff.py runs, per (task, model): python3 -I compare_runs.py RUN1 RUN2"""
+"""Compare two agent_bakeoff.py runs, per (task, variant, model): python3 -I compare_runs.py RUN1 RUN2
+
+prefer-mode runs compare the versions of the preferred tools; float (and legacy) runs
+compare primary language, Spark yes/no+version, and the library set.
+"""
 import json
 import sys
 from pathlib import Path
 
-LEGACY_TASK = "poi_s2"  # results.json from before tasks existed
-
 
 def load(d):
-    return {(r.get("task") or LEGACY_TASK, r["model"]): r
-            for r in json.loads((Path(d) / "results.json").read_text())}
+    out = {}
+    for r in json.loads((Path(d) / "results.json").read_text()):
+        r.setdefault("preferred", [])  # results from before tasks / modes existed
+        r.setdefault("tool_versions", {})
+        out[(r.get("task") or "poi_s2", r.get("variant") or "legacy", r["model"])] = r
+    return out
+
+
+def versions(r):
+    if r["preferred"]:
+        return ", ".join(f"{t} {r['tool_versions'].get(t) or 'unpinned'}" if t in r["libraries"] else f"{t} NOT USED"
+                         for t in r["preferred"])
+    return "Spark " + (r["spark_version"] or "unpinned") if "Spark" in r["libraries"] else "no Spark"
 
 
 def main(d1, d2):
     a, b = load(d1), load(d2)
     same = diff = 0
-    print("| task | model | lang run1 | lang run2 | Spark run1 | Spark run2 | libs only in 1 | libs only in 2 |")
-    print("|---|---|---|---|---|---|---|---|")
+    print("| task | variant | model | lang run1 | lang run2 | versions run1 | versions run2 | libs only in 1 | libs only in 2 |")
+    print("|---|---|---|---|---|---|---|---|---|")
     for key in sorted(a.keys() & b.keys()):
         x, y = a[key], b[key]
         lang = lambda r: next(iter(r["languages"]), "-")
-        sp = lambda r: (r["spark_version"] or "unpinned") if "Spark" in r["libraries"] else "no"
         o1, o2 = sorted(set(x["libraries"]) - set(y["libraries"])), sorted(set(y["libraries"]) - set(x["libraries"]))
-        if (lang(x), sp(x), o1, o2) == (lang(y), sp(y), [], []):
+        if x["preferred"]:  # prefer mode: we only care whether the versions moved
+            o1 = o2 = []
+        if (lang(x), versions(x), o1, o2) == (lang(y), versions(y), [], []):
             same += 1
             continue
         diff += 1
-        print(f"| {key[0]} | {key[1]} | {lang(x)} | {lang(y)} | {sp(x)} | {sp(y)} "
+        print(f"| {' | '.join(key)} | {lang(x)} | {lang(y)} | {versions(x)} | {versions(y)} "
               f"| {', '.join(o1) or '-'} | {', '.join(o2) or '-'} |")
-    print(f"\nidentical (primary language, Spark yes/no+version, library set): {same}; different: {diff}; "
-          f"only in one run: {len(a.keys() ^ b.keys())}")
+    print(f"\nidentical: {same}; different: {diff}; only in one run: {len(a.keys() ^ b.keys())}")
 
 
 if __name__ == "__main__":

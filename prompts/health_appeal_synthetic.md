@@ -1,3 +1,6 @@
+---
+prefer: Spark, vLLM
+---
 Generate a synthetic training set for fine-tuning a model that writes health
 insurance appeal letters, using Washington State data as the input.
 
@@ -25,5 +28,6 @@ insurance appeal letters, using Washington State data as the input.
   card (sources, licenses, counts, known biases and gaps).
 - Include unit tests, a README with how to run it end to end, and RUN the
   tests before you stop.
+{tooling}
 - Work only in the current directory. Don't ask me questions; make decisions
   and note them in the README.

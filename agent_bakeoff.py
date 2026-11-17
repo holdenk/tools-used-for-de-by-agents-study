@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Run every prompt in prompts/ against each Cursor model (then Cortex Code and Claude Code).
 
-Each (task, model) pair gets a fresh directory <out>/<task>/<model>/, runs with
---yolo and stream-json so we can report which tools it used, and is inspected
-for the languages, libraries and pinned versions it picked. Writes
-<out>/report.md and <out>/results.json, and keeps a CSV tally that a rerun
-restores from, so no (task, model) pair runs twice.
+Two modes per task:
+  float   - the agent picks its own stack; we mostly care WHICH tools it picks.
+  prefer  - we name the tools (the task's `prefer:` header, or --prefer); we mostly
+            care which VERSIONS it pins, and whether it actually used them.
 
-A task is just a prompt file: prompts/<task>.md. Add a file to add a task.
+Each (task, variant, model) gets a fresh directory <out>/<task>/<variant>/<model>/
+(variant is `float` or `prefer-<tools>`), runs with --yolo and stream-json so we can
+report which tools it used, and is inspected for languages, libraries and versions.
+Writes <out>/report.md and <out>/results.json, and keeps a CSV tally that a rerun
+restores from, so no (task, variant, model) runs twice.
+
+A task is just a prompt file: prompts/<task>.md, with a `{tooling}` line the mode
+fills in and an optional `prefer: Tool, Tool` front-matter header.
 """
 import argparse
 import collections
@@ -21,11 +27,33 @@ import time
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
-LEGACY_TASK = "poi_s2"  # tallies/results from before tasks existed were all this prompt
+LEGACY = "legacy"  # tally/results rows from before modes existed (old POI prompt: "Spark preferred")
+LEGACY_TASK = "poi_s2"
+MODES = ("float", "prefer")
+TOOLING = {  # replaces the {tooling} line; everything else in the prompt is identical between modes
+    "float": "- Tooling: pick whatever languages, engines and libraries you think fit\n"
+             "  best, and justify the choices in the README. Pin the versions of\n"
+             "  everything you depend on.",
+    "prefer": "- Tooling: use {tools}; that's our standard stack.\n"
+              "  Pin the versions of everything you depend on.",
+}
+
+
+def parse_prompt(text):
+    """-> (prefer list, body). Front matter is a leading ---/--- block of `key: value` lines."""
+    prefer = []
+    m = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    if m:
+        text = text[m.end():]
+        for line in m.group(1).splitlines():
+            k, _, v = line.partition(":")
+            if k.strip() == "prefer":
+                prefer = [t.strip() for t in v.split(",") if t.strip()]
+    return prefer, text
 
 
 def load_tasks(spec, prompts_dir):
-    """task name -> prompt. spec: comma list of task names or prompt file paths; default every prompts/*.md."""
+    """task name -> (prefer, body). spec: comma list of task names or prompt file paths; default every prompts/*.md."""
     if spec:
         files = [Path(s) if s.endswith((".md", ".txt")) else prompts_dir / f"{s}.md" for s in spec.split(",")]
     else:
@@ -33,7 +61,24 @@ def load_tasks(spec, prompts_dir):
     missing = [str(f) for f in files if not f.is_file()]
     if missing:
         sys.exit(f"no such prompt file(s): {', '.join(missing)}")
-    return {f.stem: f.read_text() for f in files}
+    return {f.stem: parse_prompt(f.read_text()) for f in files}
+
+
+def join_tools(tools):
+    return ", ".join(tools[:-1]) + " and " + tools[-1] if len(tools) > 1 else "".join(tools)
+
+
+def render(body, mode, tools):
+    line = TOOLING[mode].replace("{tools}", join_tools(tools))
+    if "{tooling}" in body:
+        return body.replace("{tooling}", line)
+    return body.rstrip("\n") + "\n" + line + "\n"
+
+
+def variant_name(mode, tools):
+    if mode == "float":
+        return "float"
+    return "prefer-" + "+".join(re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-") for t in tools)
 
 
 def list_models():
@@ -121,6 +166,25 @@ PINS = [  # each yields (name, version)
 ]
 
 
+
+
+LABELS = {v.lower(): v for v in LIBS.values()}
+# label -> package / artifact / property names it gets pinned under (beyond the label itself and apache-<label>)
+VERSION_ALIASES = {
+    "Flink": ["apache-flink", "flink-streaming-java", "flink-clients", "flink.version"],
+    "Kafka": ["confluent-kafka", "kafka-python", "kafka-python-ng", "aiokafka", "kafka-clients", "kafka.version"],
+    "Kafka Streams": ["kafka-streams"],
+    "Airflow": ["apache-airflow", "airflow.version"],
+    "Beam": ["apache-beam", "beam-sdks-java-core", "beam.version"],
+    "Great Expectations": ["great-expectations"], "Soda": ["soda-core"], "Deequ": ["pydeequ", "deequ"],
+    "Delta Lake": ["delta-spark", "deltalake", "delta-core"], "Iceberg": ["pyiceberg", "iceberg-spark-runtime"],
+    "Sedona": ["apache-sedona", "sedona-spark-shaded"], "PyTorch": ["torch"],
+    "HF transformers": ["transformers"], "HF datasets": ["datasets"], "HF Hub": ["huggingface-hub"],
+    "OpenAI SDK": ["openai"], "Anthropic SDK": ["anthropic"], "LangChain": ["langchain"],
+    "Quix Streams": ["quixstreams"],
+}
+
+
 def project_files(workdir):
     return [f for f in workdir.rglob("*") if f.is_file() and not SKIP & set(f.relative_to(workdir).parts)]
 
@@ -136,6 +200,13 @@ def pinned_versions(workdir):
     return pins
 
 
+def docs_text(workdir):
+    """Dependency files plus free-form places versions get written down (README, Dockerfile, submit scripts)."""
+    return "\n".join(f.read_text(errors="ignore") for f in project_files(workdir)
+                     if f.name in DEP_FILES or f.name == "Dockerfile"
+                     or f.suffix in (".md", ".sh", ".yaml", ".yml", ".sbt", ".cfg", ".txt"))
+
+
 SPARK_VERSION_RX = [  # first hit wins; Python, then Scala/Java, then free-form (README, Dockerfile, submit scripts)
     r"""pyspark(?:\[[\w,]+\])?\s*(?:==|>=|~=|<=|<|>)\s*([\d][\w.]*)""",
     r"""['"]pyspark['"]\s*,?\s*(?:version\s*=\s*)?['"]?\s*[\^~=<>]*\s*(\d[\w.]*)""",
@@ -147,13 +218,31 @@ SPARK_VERSION_RX = [  # first hit wins; Python, then Scala/Java, then free-form 
 ]
 
 
-def spark_version(workdir):
-    text = ""
-    for f in project_files(workdir):
-        if f.name in DEP_FILES or f.name == "Dockerfile" or f.suffix in (".md", ".sh", ".yaml", ".yml", ".sbt", ".cfg", ".txt"):
-            text += f.read_text(errors="ignore") + "\n"
+def spark_version(text):
     for rx in SPARK_VERSION_RX:
         m = re.search(rx, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _norm(name):
+    """'org.apache.flink:flink-streaming-java_2.12' -> 'flinkstreamingjava'"""
+    name = name.lower().split(":")[-1]
+    return re.sub(r"[^a-z0-9]", "", re.sub(r"_2\.\d+$", "", name))
+
+
+def tool_version(label, pins, docs, spark_v):
+    """Best guess at the version an agent used for a LIBS label: dependency pins first, then prose."""
+    if label in ("Spark", "Spark Structured Streaming"):
+        return spark_v
+    names = [label, "apache-" + label] + VERSION_ALIASES.get(label, [])
+    wanted = {_norm(n) for n in names}
+    for pin, ver in pins.items():
+        if _norm(pin) in wanted:
+            return ver
+    for n in names:
+        m = re.search(rf"(?i)\b{re.escape(n)}[\s\-_]*(?:version\s*)?v?(\d+\.\d+(?:\.\d+)?)\b", docs)
         if m:
             return m.group(1)
     return None
@@ -197,11 +286,15 @@ def summarize(stream, workdir):
         elif ev.get("type") == "result":
             result = ev
     langs, libs = inspect_project(workdir)
+    pins, docs = pinned_versions(workdir), docs_text(workdir)
+    spark_v = spark_version(docs) if "Spark" in libs else None
+    tool_versions = {lib: v for lib in libs if (v := tool_version(lib, pins, docs, spark_v))}
     return {
         "languages": langs,
         "libraries": libs,
-        "versions": pinned_versions(workdir),
-        "spark_version": spark_version(workdir) if "Spark" in libs else None,
+        "tool_versions": tool_versions,  # LIBS label -> version, for every detected library we found a version for
+        "versions": pins,
+        "spark_version": spark_v,
         "tools": dict(tools.most_common()),
         "shell_commands": shell_cmds,
         "ok": bool(result) and not result.get("is_error", True),
@@ -213,10 +306,11 @@ def summarize(stream, workdir):
     }
 
 
-def run_one(task, model, root, prompt, timeout):
-    wd = root / task / model
+def run_one(run, model, root, timeout):
+    wd = root / run["task"] / run["variant"] / model
     shutil.rmtree(wd, ignore_errors=True)  # partial dir from a crashed run
     wd.mkdir(parents=True)
+    prompt = run["prompt"]
     if model in EXTRAS:
         cmd = EXTRAS[model](prompt)
     else:
@@ -230,7 +324,8 @@ def run_one(task, model, root, prompt, timeout):
         stream = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         err, status = "", "TIMEOUT"
     (wd.parent / f"{model}.stream.jsonl").write_text(stream)
-    return {"task": task, "model": model, "status": status, "wall_s": round(time.time() - t0),
+    return {"task": run["task"], "variant": run["variant"], "mode": run["mode"], "preferred": run["preferred"],
+            "model": model, "status": status, "wall_s": round(time.time() - t0),
             **summarize(stream, wd), "stderr": err[-400:]}
 
 
@@ -238,51 +333,81 @@ def primary_language(r):
     return next(iter(r["languages"]), "-")
 
 
+def preferred_cell(r):
+    """'Spark 3.5.1, Kafka unpinned' / 'vLLM NOT USED' for a prefer-mode run."""
+    return ", ".join(f"{t} {r['tool_versions'].get(t) or 'unpinned'}" if t in r["libraries"] else f"{t} NOT USED"
+                     for t in r["preferred"]) or "-"
+
+
+def pivot(rows, cols, header, cell):
+    """Markdown table: one row per model, one column per (task, variant)."""
+    lines = ["| model | " + " | ".join(header(c) for c in cols) + " |", "|---" * (len(cols) + 1) + "|"]
+    for m in rows:
+        lines.append(f"| {m} | " + " | ".join(cell(c, m) for c in cols) + " |")
+    return lines
+
+
 def report(results):
-    tasks = list(dict.fromkeys(r["task"] for r in results))
-    by_task = {t: [r for r in results if r["task"] == t] for t in tasks}
-    lines = ["# Agent DE bakeoff", "", f"tasks: {', '.join(tasks)}", ""]
-
-    # cross-task views first: what each model reached for, and how popular each library is per task
+    groups = list(dict.fromkeys((r["task"], r["variant"]) for r in results))
+    by_group = {g: [r for r in results if (r["task"], r["variant"]) == g] for g in groups}
     models = list(dict.fromkeys(r["model"] for r in results))
-    cell = {(r["task"], r["model"]): r for r in results}
-    lines += ["## Primary language by model and task", "",
-              "| model | " + " | ".join(tasks) + " |", "|---" * (len(tasks) + 1) + "|"]
-    for m in models:
-        lines.append(f"| {m} | " + " | ".join(
-            primary_language(cell[t, m]) if (t, m) in cell else "" for t in tasks) + " |")
-    counts = {t: collections.Counter(lib for r in by_task[t] for lib in r["libraries"]) for t in tasks}
-    libs = sorted({lib for c in counts.values() for lib in c}, key=lambda l: -sum(c[l] for c in counts.values()))
-    lines += ["", "## Library use by task (models using it / models run)", "",
-              "| library | " + " | ".join(tasks) + " |", "|---" * (len(tasks) + 1) + "|"]
-    for lib in libs:
-        lines.append(f"| {lib} | " + " | ".join(
-            f"{counts[t][lib]}/{len(by_task[t])}" if counts[t][lib] else "" for t in tasks) + " |")
+    cell = {(r["task"], r["variant"], r["model"]): r for r in results}
+    get = lambda g, m: cell.get((*g, m))
+    lines = ["# Agent DE bakeoff", "", f"tasks: {', '.join(dict.fromkeys(t for t, _ in groups))}", ""]
 
-    for t in tasks:
-        lines += ["", f"## {t}", "",
-                  "| model | status | wall s | files | languages (LOC) | libraries | Spark | pinned versions |",
+    prefer = [g for g in groups if by_group[g][0]["mode"] == "prefer"]
+    if prefer:
+        lines += ["## Prefer mode: versions of the tools we asked for", "",
+                  "`NOT USED` means the agent ignored the instruction; `unpinned` means it used the tool "
+                  "without a version we could find.", ""]
+        lines += pivot(models, prefer, lambda g: f"{g[0]} ({', '.join(by_group[g][0]['preferred'])})",
+                       lambda g, m: preferred_cell(get(g, m)) if get(g, m) else "")
+        spread = collections.defaultdict(collections.Counter)
+        for g in prefer:
+            for r in by_group[g]:
+                for t in r["preferred"]:
+                    spread[t][r["tool_versions"].get(t, "unpinned") if t in r["libraries"] else "NOT USED"] += 1
+        lines += ["", "### Version spread across all prefer-mode runs", ""]
+        lines += [f"- **{t}**: " + ", ".join(f"{v} ×{n}" for v, n in c.most_common()) for t, c in spread.items()]
+        lines.append("")
+
+    floating = [g for g in groups if by_group[g][0]["mode"] == "float"]
+    if floating:
+        lines += ["## Float mode: primary language", ""]
+        lines += pivot(models, floating, lambda g: g[0], lambda g, m: primary_language(get(g, m)) if get(g, m) else "")
+        counts = {g: collections.Counter(lib for r in by_group[g] for lib in r["libraries"]) for g in floating}
+        libs = sorted({lib for c in counts.values() for lib in c}, key=lambda l: -sum(c[l] for c in counts.values()))
+        lines += ["", "## Float mode: library use by task (models using it / models run)", "",
+                  "| library | " + " | ".join(t for t, _ in floating) + " |", "|---" * (len(floating) + 1) + "|"]
+        for lib in libs:
+            lines.append(f"| {lib} | " + " | ".join(
+                f"{counts[g][lib]}/{len(by_group[g])}" if counts[g][lib] else "" for g in floating) + " |")
+        lines.append("")
+
+    for g in groups:
+        rs = by_group[g]
+        lines += [f"## {g[0]} / {g[1]}", "",
+                  "| model | status | wall s | files | languages (LOC) | libraries | preferred | tool versions |",
                   "|---|---|---|---|---|---|---|---|"]
-        for r in by_task[t]:
+        for r in rs:
             langs = ", ".join(f"{k} {v}" for k, v in r["languages"].items()) or "-"
-            pins = ", ".join(f"{k} {v}" for k, v in list(r["versions"].items())[:12]) or "-"
-            lines.append(f"| {r['model']} | {r['status']} | {r['wall_s']} | {r['files']} "
-                         f"| {langs} | {', '.join(r['libraries']) or '-'} "
-                         f"| {('Spark ' + (r['spark_version'] or '(unpinned)')) if 'Spark' in r['libraries'] else 'no'} "
-                         f"| {pins} |")
-        for r in by_task[t]:
-            lines += ["", f"### {t} / {r['model']}", f"languages: {r['languages']}", f"libraries: {r['libraries']}",
-                      f"versions: {r['versions']}",
-                      f"agent tools: {r['tools']}", f"usage: {r['usage']}"]
+            tv = ", ".join(f"{k} {v}" for k, v in list(r["tool_versions"].items())[:12]) or "-"
+            lines.append(f"| {r['model']} | {r['status']} | {r['wall_s']} | {r['files']} | {langs} "
+                         f"| {', '.join(r['libraries']) or '-'} | {preferred_cell(r)} | {tv} |")
+        for r in rs:
+            lines += ["", f"### {g[0]} / {g[1]} / {r['model']}", f"languages: {r['languages']}",
+                      f"libraries: {r['libraries']}", f"tool versions: {r['tool_versions']}",
+                      f"pinned: {r['versions']}", f"agent tools: {r['tools']}", f"usage: {r['usage']}"]
             lines += [f"- `{c[:160]}`" for c in r["shell_commands"][:15]]
             if r["final"]:
                 lines += ["", "final message tail:", "", "> " + r["final"].replace("\n", "\n> ")]
             if r["stderr"].strip():
                 lines += ["", "stderr tail:", "", "    " + r["stderr"].strip().replace("\n", "\n    ")]
-    return "\n".join(lines) + "\n"
+        lines.append("")
+    return "\n".join(lines)
 
 
-PLAIN = ("task", "model", "status")  # every other column is JSON-encoded
+PLAIN = ("task", "variant", "mode", "model", "status")  # every other column is JSON-encoded
 
 
 def load_tally(path):
@@ -291,8 +416,13 @@ def load_tally(path):
     with path.open(newline="") as f:
         rows = [{k: v if k in PLAIN else (json.loads(v) if v else None) for k, v in row.items()}
                 for row in csv.DictReader(f)]
-    for r in rows:
+    for r in rows:  # rows written before tasks / modes existed
         r["task"] = r.get("task") or LEGACY_TASK
+        r["variant"] = r.get("variant") or LEGACY
+        r["mode"] = r.get("mode") or LEGACY
+        r["preferred"] = r.get("preferred") or []
+        r["tool_versions"] = r.get("tool_versions") or (
+            {"Spark": r["spark_version"]} if r.get("spark_version") else {})
     return rows
 
 
@@ -308,45 +438,79 @@ def write_tally(path, results):
     tmp.replace(path)
 
 
+def canonical(tool):
+    label = LABELS.get(tool.lower())
+    if not label:
+        print(f"warning: {tool!r} isn't a LIBS label, so the report can't tell whether it was used", file=sys.stderr)
+    return label or tool
+
+
+def plan_runs(tasks, modes, prefer_override):
+    runs = []
+    for task, (prefer, body) in tasks.items():
+        for mode in modes:
+            tools = (prefer_override or [canonical(t) for t in prefer]) if mode == "prefer" else []
+            if mode == "prefer" and not tools:
+                print(f"warning: {task} has no `prefer:` header and no --prefer given; skipping prefer mode",
+                      file=sys.stderr)
+                continue
+            runs.append({"task": task, "mode": mode, "preferred": tools,
+                         "variant": variant_name(mode, tools), "prompt": render(body, mode, tools)})
+    return runs
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="bakeoff",
-                    help="run root; each (task, model) gets a fresh <out>/<task>/<model>. Rerun with the same dir to resume")
-    ap.add_argument("--csv", help="running tally (default <out>/tally.csv); (task, model) pairs already in it are skipped")
+                    help="run root; each run gets a fresh <out>/<task>/<variant>/<model>. Rerun with the same dir to resume")
+    ap.add_argument("--csv", help="running tally (default <out>/tally.csv); runs already in it are skipped")
     ap.add_argument("--tasks", help="comma-separated task names (prompts/<name>.md) or prompt file paths; default all")
     ap.add_argument("--prompts-dir", default=str(PROMPTS_DIR), help="where task prompts live (default %(default)s)")
+    ap.add_argument("--mode", choices=(*MODES, "both"), default="both",
+                    help="float: agent picks the stack (we track tools). prefer: we name the stack (we track versions)")
+    ap.add_argument("--prefer", help="comma-separated tools for prefer mode, overriding every task's `prefer:` header")
     ap.add_argument("--models", help="comma-separated; default is every model from `agent --list-models`")
     ap.add_argument("--match", help="regex filter on the model list (e.g. 'sonnet|opus')")
     ap.add_argument("--no-extras", action="store_true", help="skip the cortex + claude runs at the end")
     ap.add_argument("--timeout", type=int, default=3600, help="per-run seconds")
-    ap.add_argument("--dry-run", action="store_true", help="print the (task, model) pairs that would run")
+    ap.add_argument("--dry-run", action="store_true", help="print the (task, variant, model) runs and exit")
+    ap.add_argument("--print-prompts", action="store_true", help="print each rendered prompt and exit")
     a = ap.parse_args()
 
-    tasks = load_tasks(a.tasks, Path(a.prompts_dir))
+    modes = MODES if a.mode == "both" else (a.mode,)
+    prefer = [canonical(t.strip()) for t in a.prefer.split(",") if t.strip()] if a.prefer else None
+    runs = plan_runs(load_tasks(a.tasks, Path(a.prompts_dir)), modes, prefer)
+    if a.print_prompts:
+        for run in runs:
+            print(f"===== {run['task']} / {run['variant']} =====\n{run['prompt']}")
+        return 0
+
     root = Path(a.out).resolve()
     tally = Path(a.csv) if a.csv else root / "tally.csv"
     results = load_tally(tally)
-    done = {(r["task"], r["model"]) for r in results}
+    done = {(r["task"], r["variant"], r["model"]) for r in results}
 
     models = a.models.split(",") if a.models else list_models()
     if not a.no_extras and not a.models:
         models += list(EXTRAS)
     if a.match:
         models = [m for m in models if re.search(a.match, m)]
-    todo = [(t, m) for t in tasks for m in models]
+    todo = [(run, m) for run in runs for m in models]
     if a.dry_run:
-        for t, m in todo:
-            print(f"{t}\t{m}" + ("\t(done)" if (t, m) in done else ""))
+        for run, m in todo:
+            print(f"{run['task']}\t{run['variant']}\t{m}" + ("\t(done)" if (run["task"], run["variant"], m) in done else ""))
         return 0
 
     root.mkdir(parents=True, exist_ok=True)
-    for i, (t, m) in enumerate(todo, 1):
-        if (t, m) in done:
-            print(f"[{i}/{len(todo)}] {t} / {m} already in {tally}, skipping", flush=True)
+    for i, (run, m) in enumerate(todo, 1):
+        label = f"{run['task']} / {run['variant']} / {m}"
+        if (run["task"], run["variant"], m) in done:
+            print(f"[{i}/{len(todo)}] {label} already in {tally}, skipping", flush=True)
             continue
-        print(f"[{i}/{len(todo)}] {t} / {m} ...", flush=True)
-        r = run_one(t, m, root, tasks[t], a.timeout)
-        print(f"    {r['status']} {r['wall_s']}s langs={list(r['languages'])} libs={r['libraries']}", flush=True)
+        print(f"[{i}/{len(todo)}] {label} ...", flush=True)
+        r = run_one(run, m, root, a.timeout)
+        print(f"    {r['status']} {r['wall_s']}s langs={list(r['languages'])} libs={r['libraries']}"
+              + (f" preferred: {preferred_cell(r)}" if r["preferred"] else ""), flush=True)
         results.append(r)
         write_tally(tally, results)
         (root / "results.json").write_text(json.dumps(results, indent=1))

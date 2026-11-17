@@ -1,3 +1,6 @@
+---
+prefer: Spark, Kafka
+---
 Create a streaming job that looks for credit card fraud in real time.
 
 - Input: a stream of card authorization events (JSON on a Kafka topic or
@@ -20,5 +23,6 @@ Create a streaming job that looks for credit card fraud in real time.
   run without a real cluster and assert injected fraud is caught and normal
   traffic isn't, a README with the deploy / submit command, and RUN the tests
   before you stop.
+{tooling}
 - Work only in the current directory. Don't ask me questions; make decisions
   and note them in the README.

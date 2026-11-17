@@ -1,6 +1,8 @@
+---
+prefer: Spark
+---
 Build a data pipeline that converts ALL of the Mapbox POI data into S2 bounding
-boxes, running in parallel on a cluster (Spark preferred; Beam/Dask/Ray are
-fine if you justify it).
+boxes, running in parallel on a cluster.
 
 - Input: Mapbox POI records (GeoJSON / Parquet / CSV, point or polygon
   geometry). Support a path or S3/GCS prefix, so it scales past one machine.
@@ -11,5 +13,6 @@ fine if you justify it).
   crash), and skew (dense city cells).
 - Include a small synthetic sample dataset, unit tests, a README with the
   cluster submit command, and RUN the tests before you stop.
+{tooling}
 - Work only in the current directory. Don't ask me questions; make decisions
   and note them in the README.

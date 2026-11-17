@@ -1,3 +1,6 @@
+---
+prefer: Spark, Airflow
+---
 Write an hourly job that flags data quality issues in a production event table,
 and the schedule definition that runs it.
 
@@ -15,9 +18,10 @@ and the schedule definition that runs it.
   observed vs expected, sample offending keys) and an alert hook (a stub is
   fine) that fires on high severity. Thresholds are configurable and reruns of
   the same hour are idempotent.
-- Include the scheduler definition (pick one and justify it), a synthetic
-  sample dataset with injected issues, unit tests that assert every injected
-  issue is flagged and clean hours are not, a README with the deploy / schedule
-  steps, and RUN the tests before you stop.
+- Include the scheduler definition, a synthetic sample dataset with injected
+  issues, unit tests that assert every injected issue is flagged and clean
+  hours are not, a README with the deploy / schedule steps, and RUN the tests
+  before you stop.
+{tooling}
 - Work only in the current directory. Don't ask me questions; make decisions
   and note them in the README.
