@@ -165,7 +165,8 @@ LIBS = {
     # ML / LLM / synthetic data
     r"sklearn|scikit-learn": "scikit-learn", r"xgboost": "XGBoost", r"lightgbm": "LightGBM",
     r"\btorch\b|pytorch": "PyTorch", r"\bonnx": "ONNX", r"mlflow": "MLflow",
-    r"\btransformers\b": "HF transformers", r"from datasets import|import datasets\b": "HF datasets",
+    # an import or a pip dependency, not Maven Shade's <transformers> tag
+    r"(?:from|import)\s+transformers\b|^\s*[\"']?transformers[\"']?\s*(?:[=<>~!,\]]|$)": "HF transformers", r"from datasets import|import datasets\b": "HF datasets",
     r"huggingface_hub": "HF Hub", r"\bpeft\b": "PEFT", r"\btrl\b": "TRL", r"vllm": "vLLM",
     r"\bopenai\b": "OpenAI SDK", r"\banthropic\b": "Anthropic SDK", r"litellm": "LiteLLM",
     r"langchain": "LangChain", r"llama_index|llama-index": "LlamaIndex", r"\bdspy\b": "DSPy",
