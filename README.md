@@ -12,6 +12,11 @@ pinned versions and agent tools each one used.
 | `hourly_data_quality` | An hourly job that flags data quality issues in an `orders` event table | Spark, Airflow |
 | `cc_fraud_streaming` | A streaming job that looks for credit card fraud in card authorization events | Spark, Kafka |
 | `health_appeal_synthetic` | A synthetic training set for fine-tuning a health insurance appeal model, seeded from Washington State data | Spark, vLLM |
+| `cdc_scd2_dimension` | Debezium-style CDC events into an SCD Type 2 customer dimension | Spark, Delta Lake |
+| `clickstream_sessionization` | Sessionize web clickstream (late data, login stitching, bots) into sessions, funnel and DAU tables | Spark |
+| `nyc_taxi_lakehouse` | Bronze / silver / gold lakehouse over the full NYC TLC trip history, with schema drift and quarantine | Spark, Iceberg |
+| `entity_resolution` | Deduplicate and link customer records across three sources with no shared ID, with ground-truth evaluation | Spark |
+| `point_in_time_features` | Point-in-time correct churn features: leakage-free backfill plus a daily incremental that matches it | Spark |
 
 ## Modes
 

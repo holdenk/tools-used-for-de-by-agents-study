@@ -176,6 +176,10 @@ LIBS = {
     r"pypdf|pdfplumber|pdfminer|pymupdf|\bfitz\b": "PDF parsing", r"beautifulsoup|\bbs4\b": "BeautifulSoup",
     r"\blxml\b": "lxml", r"\brequests\b": "requests", r"\bhttpx\b": "httpx", r"scrapy": "Scrapy",
     r"tenacity|backoff": "retry lib",
+    # entity resolution / graphs / CDC / feature stores / query engines
+    r"splink": "Splink", r"zingg": "Zingg", r"\bdedupe\b": "dedupe", r"recordlinkage": "recordlinkage",
+    r"graphframes": "GraphFrames", r"networkx": "networkx", r"debezium": "Debezium", r"\bfeast\b": "Feast",
+    r"hopsworks|\bhsfs\b": "Hopsworks", r"\btrino\b|presto": "Trino/Presto",
     r"pytest|unittest|scalatest|junit": "tests",
 }
 SKIP = {".git", ".cursor", ".venv", "venv", "node_modules", "__pycache__", "target", ".pytest_cache",
@@ -211,7 +215,7 @@ VERSION_ALIASES = {
     "Sedona": ["apache-sedona", "sedona-spark-shaded"], "PyTorch": ["torch"],
     "HF transformers": ["transformers"], "HF datasets": ["datasets"], "HF Hub": ["huggingface-hub"],
     "OpenAI SDK": ["openai"], "Anthropic SDK": ["anthropic"], "LangChain": ["langchain"],
-    "Quix Streams": ["quixstreams"],
+    "Quix Streams": ["quixstreams"], "GraphFrames": ["graphframes"], "Splink": ["splink"],
 }
 
 
