@@ -178,7 +178,7 @@ LIBS = {
     r"\blxml\b": "lxml", r"\brequests\b": "requests", r"\bhttpx\b": "httpx", r"scrapy": "Scrapy",
     r"tenacity|backoff": "retry lib",
     # entity resolution / graphs / CDC / feature stores / query engines
-    r"splink": "Splink", r"zingg": "Zingg", r"\bdedupe\b": "dedupe", r"recordlinkage": "recordlinkage",
+    r"splink": "Splink", r"zingg": "Zingg", r"(?:from|import)\s+dedupe\b|^\s*[\"']?dedupe[\"']?\s*(?:[=<>~!,\]]|$)": "dedupe", r"recordlinkage": "recordlinkage",
     r"graphframes": "GraphFrames", r"networkx": "networkx", r"debezium": "Debezium", r"\bfeast\b": "Feast",
     r"hopsworks|\bhsfs\b": "Hopsworks", r"\btrino\b|presto": "Trino/Presto",
     r"chispa": "chispa", r"phonenumbers": "phonenumbers", r"usaddress|libpostal": "address parsing",
