@@ -166,7 +166,7 @@ LIBS = {
     r"sklearn|scikit-learn": "scikit-learn", r"xgboost": "XGBoost", r"lightgbm": "LightGBM",
     r"\btorch\b|pytorch": "PyTorch", r"\bonnx": "ONNX", r"mlflow": "MLflow",
     # an import or a pip dependency, not Maven Shade's <transformers> tag
-    r"(?:from|import)\s+transformers\b|^\s*[\"']?transformers[\"']?\s*(?:[=<>~!,\]]|$)": "HF transformers", r"from datasets import|import datasets\b": "HF datasets",
+    r"^\s*(?:from|import)\s+transformers\b|^\s*[\"']?transformers[\"']?\s*(?:[=<>~!,\]]|$)": "HF transformers", r"from datasets import|import datasets\b": "HF datasets",
     r"huggingface_hub": "HF Hub", r"\bpeft\b": "PEFT", r"\btrl\b": "TRL", r"vllm": "vLLM",
     r"\bopenai\b": "OpenAI SDK", r"\banthropic\b": "Anthropic SDK", r"litellm": "LiteLLM",
     r"langchain": "LangChain", r"llama_index|llama-index": "LlamaIndex", r"\bdspy\b": "DSPy",
@@ -178,7 +178,7 @@ LIBS = {
     r"\blxml\b": "lxml", r"\brequests\b": "requests", r"\bhttpx\b": "httpx", r"scrapy": "Scrapy",
     r"tenacity|backoff": "retry lib",
     # entity resolution / graphs / CDC / feature stores / query engines
-    r"splink": "Splink", r"zingg": "Zingg", r"(?:from|import)\s+dedupe\b|^\s*[\"']?dedupe[\"']?\s*(?:[=<>~!,\]]|$)": "dedupe", r"recordlinkage": "recordlinkage",
+    r"splink": "Splink", r"zingg": "Zingg", r"^\s*(?:from|import)\s+dedupe\b|^\s*[\"']?dedupe[\"']?\s*(?:[=<>~!,\]]|$)": "dedupe", r"recordlinkage": "recordlinkage",
     r"graphframes": "GraphFrames", r"networkx": "networkx", r"debezium": "Debezium", r"\bfeast\b": "Feast",
     r"hopsworks|\bhsfs\b": "Hopsworks", r"\btrino\b|presto": "Trino/Presto",
     r"chispa": "chispa", r"phonenumbers": "phonenumbers", r"usaddress|libpostal": "address parsing",
