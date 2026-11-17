@@ -180,6 +180,8 @@ LIBS = {
     r"splink": "Splink", r"zingg": "Zingg", r"\bdedupe\b": "dedupe", r"recordlinkage": "recordlinkage",
     r"graphframes": "GraphFrames", r"networkx": "networkx", r"debezium": "Debezium", r"\bfeast\b": "Feast",
     r"hopsworks|\bhsfs\b": "Hopsworks", r"\btrino\b|presto": "Trino/Presto",
+    r"chispa": "chispa", r"phonenumbers": "phonenumbers", r"usaddress|libpostal": "address parsing",
+    r"jellyfish": "jellyfish", r"superset": "Superset",
     r"pytest|unittest|scalatest|junit": "tests",
 }
 SKIP = {".git", ".cursor", ".venv", "venv", "node_modules", "__pycache__", "target", ".pytest_cache",
@@ -301,11 +303,11 @@ def parse_answer(text):
     """The JSON object from an ask-style final message (bare, or in a ```json fence), or None."""
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
     candidates = [fence.group(1)] if fence else []
-    if "{" in text and "}" in text:
-        candidates.append(text[text.index("{"):text.rindex("}") + 1])
+    if "{" in text:
+        candidates.append(text[text.index("{"):])
     for c in candidates:
         try:
-            ans = json.loads(c)
+            ans, _ = json.JSONDecoder().raw_decode(c)  # ignores trailing junk after the object
         except ValueError:
             continue
         if isinstance(ans, dict):
@@ -319,6 +321,8 @@ LANG_ALIASES = {**{v.lower(): v for v in LANGS.values()}, "bash": "Shell", "sh":
 
 def language_name(text):
     """'Java 17 (Eclipse Temurin)' -> 'Java'; 'Bash scripts' -> 'Shell'; unknown -> its first word."""
+    if re.match(r"\s*(spark|hive|ansi)\s*sql", text, re.I):
+        return "SQL"
     word = (re.findall(r"[A-Za-z][\w+#]*", text) or [text])[0]
     return LANG_ALIASES.get(word.lower(), word)
 
