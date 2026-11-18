@@ -371,20 +371,31 @@ def valid_answer(ans):
             and all(isinstance(c, dict) and isinstance(c.get("name"), str) and c["name"].strip() for c in comps))
 
 
+def split_component(c):
+    """'BeautifulSoup4 + lxml' at '4.12.3 / 5.3.0' -> one component each, when names and versions pair up 1:1."""
+    names = re.split(r"\s+(?:\+|/|and)\s+", str(c["name"]))
+    vers = re.split(r"\s*/\s*|\s*;\s*", str(c.get("version") or ""))
+    if len(names) > 1 and len(names) == len(vers):
+        return [{**c, "name": n, "version": v} for n, v in zip(names, vers)]
+    return [c]
+
+
 def inspect_answer(ans):
     """(languages, libraries, tool_versions, pins) from an ask-style answer, using the same LIBS labels."""
     comps = [c for c in ans.get("components") or [] if isinstance(c, dict) and c.get("name")]
+    comps = [part for c in comps for part in split_component(c)]
     libs, candidates = set(), collections.defaultdict(list)
     for i, c in enumerate(comps):
         name = str(c["name"])
-        ver = re.match(SPEC, str(c.get("version") or "").strip())  # skips "bundled with Spark"
+        # the whole string must be one spec (plus an optional "(note)"); "3.5.1 || 4.0.0" or prose stays unresolved
+        ver = re.fullmatch(rf"({SPEC})(?:\s*\([^)]*\))?", str(c.get("version") or "").strip())
         # code regexes catch `pyspark` / `confluent-kafka`; the bare label catches prose like "Apache Spark"
         hits = {label for rx, label in LIBS.items()
                 if re.search(rx, name, re.I) or re.search(rf"\b{re.escape(label)}\b", name, re.I)}
         libs |= hits
         for label in hits:
             if ver:
-                candidates[label].append((len(hits), i, _spec(ver.group(0))))
+                candidates[label].append((len(hits), i, _spec(ver.group(1))))
     # A component that hits several labels is usually a connector (spark-sql-kafka, flink-connector-kafka),
     # so for each label prefer a component that hits only that label, then the first one listed.
     tool_versions = {label: min(cs)[2] for label, cs in candidates.items()}
