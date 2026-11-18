@@ -364,6 +364,13 @@ def language_name(text):
     return LANG_ALIASES.get(word.lower(), word)
 
 
+def valid_answer(ans):
+    """An ask answer counts as an observation only if every component is an object with a name."""
+    comps = ans.get("components") if isinstance(ans, dict) else None
+    return (isinstance(comps, list) and bool(comps)
+            and all(isinstance(c, dict) and isinstance(c.get("name"), str) and c["name"].strip() for c in comps))
+
+
 def inspect_answer(ans):
     """(languages, libraries, tool_versions, pins) from an ask-style answer, using the same LIBS labels."""
     comps = [c for c in ans.get("components") or [] if isinstance(c, dict) and c.get("name")]
@@ -415,7 +422,7 @@ def summarize(stream, workdir, style="build"):
     answer, invalid = None, False
     if style == "ask":
         answer = parse_answer(result.get("result") or "")
-        invalid = not (isinstance(answer, dict) and isinstance(answer.get("components"), list))
+        invalid = not valid_answer(answer)
         langs, libs, tool_versions, pins = ({}, [], {}, {}) if invalid else inspect_answer(answer)
         spark_v = tool_versions.get("Spark")
     else:
