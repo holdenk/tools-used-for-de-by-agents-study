@@ -373,10 +373,13 @@ def valid_answer(ans):
 
 def split_component(c):
     """'BeautifulSoup4 + lxml' at '4.12.3 / 5.3.0' -> one component each, when names and versions pair up 1:1."""
-    names = re.split(r"\s+(?:\+|/|and)\s+", str(c["name"]))
+    # separators inside "(...)" describe parts of one library ("Ray (core + Ray Data)"), so don't split there
+    names = re.split(r"\s+(?:\+|/|and)\s+(?![^()]*\))", str(c["name"]))
     vers = re.split(r"\s*/\s*|\s*;\s*", str(c.get("version") or ""))
     if len(names) > 1 and len(names) == len(vers):
         return [{**c, "name": n, "version": v} for n, v in zip(names, vers)]
+    if len(names) > 1:  # several libraries, versions that don't pair up: keep the libraries, drop the versions
+        return [{**c, "name": n, "version": ""} for n in names]
     return [c]
 
 
@@ -388,7 +391,9 @@ def inspect_answer(ans):
     for i, c in enumerate(comps):
         name = str(c["name"])
         # the whole string must be one spec (plus an optional "(note)"); "3.5.1 || 4.0.0" or prose stays unresolved
-        ver = re.fullmatch(rf"({SPEC})(?:\s*\([^)]*\))?", str(c.get("version") or "").strip())
+        ver = re.fullmatch(rf"({SPEC})(?:\s*\(([^)]*)\))?", str(c.get("version") or "").strip())
+        if ver and ver.group(2) and re.search(r"\bor\b|\|\||\beither\b|\balternativ", ver.group(2), re.I):
+            ver = None  # "3.5.1 (or 4.0.0)" names an alternative, so it isn't one version
         # code regexes catch `pyspark` / `confluent-kafka`; the bare label catches prose like "Apache Spark"
         hits = {label for rx, label in LIBS.items()
                 if re.search(rx, name, re.I) or re.search(rf"\b{re.escape(label)}\b", name, re.I)}
