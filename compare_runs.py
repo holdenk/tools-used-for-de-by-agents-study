@@ -19,6 +19,8 @@ def load(d):
 
 
 def versions(r):
+    if r.get("invalid_answer"):
+        return "INVALID ANSWER"
     if r["preferred"]:
         return ", ".join(f"{t} {r['tool_versions'].get(t) or 'unpinned'}" if t in r["libraries"] else f"{t} NOT USED"
                          for t in r["preferred"])
@@ -34,9 +36,12 @@ def main(d1, d2):
         x, y = a[key], b[key]
         lang = lambda r: next(iter(r["languages"]), "-")
         o1, o2 = sorted(set(x["libraries"]) - set(y["libraries"])), sorted(set(y["libraries"]) - set(x["libraries"]))
-        if x["preferred"]:  # prefer mode: we only care whether the versions moved
+        if x["preferred"]:  # prefer mode: we only care whether the preferred tools' versions moved
             o1 = o2 = []
-        if (lang(x), versions(x), o1, o2) == (lang(y), versions(y), [], []):
+            unchanged = versions(x) == versions(y)
+        else:
+            unchanged = (lang(x), versions(x), o1, o2) == (lang(y), versions(y), [], [])
+        if unchanged:
             same += 1
             continue
         diff += 1

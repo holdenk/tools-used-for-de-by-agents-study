@@ -192,15 +192,21 @@ SKIP = {".git", ".cursor", ".venv", "venv", "node_modules", "__pycache__", "targ
 DEP_FILES = {"requirements.txt", "pyproject.toml", "build.sbt", "pom.xml", "build.gradle",
              "build.gradle.kts", "Cargo.toml", "go.mod", "package.json"}
 PINS = [  # each yields (name, version)
-    r"""^\s*["']?([A-Za-z][\w.\-]*)(?:\[[\w,]+\])?\s*(?:==|>=|~=|<=|<|>)\s*([\w.*]+)""",  # pip
+    r"""^\s*["']?([A-Za-z][\w.\-]*)(?:\[[\w,]+\])?\s*((?:==|>=|~=|<=|!=|<|>)\s*[\w.*]+(?:\s*,\s*(?:==|>=|~=|<=|!=|<|>)\s*[\w.*]+)*)""",  # pip
     r'"[\w.\-]+"\s*%%?\s*"([\w.\-]+)"\s*%\s*"([\w.\-]+)"',                              # sbt
     r"<artifactId>([\w.\-]+)</artifactId>\s*<version>([^<]+)</version>",                # maven dep
-    r"<([\w.\-]*version)>(\d[^<]*)</",                                                  # maven prop
+    r"<([\w.\-]+version)>(\d[^<]*)</",                                                  # maven prop (not bare <version>)
     r"""["']([\w.\-]+:[\w.\-]+):(\d[\w.\-]*)["']""",                                    # gradle
     r'^\s*([\w\-]+)\s*=\s*"(\d[\w.\-]*)"',                                              # Cargo
     r"^\s*([\w./\-]+)\s+(v\d[\w.\-]*)",                                                 # go.mod
-    r'"(@?[\w./\-]+)"\s*:\s*"[\^~]?(\d[\w.\-]*)"',                                      # package.json
+    r'"(@?[\w./\-]+)"\s*:\s*"([\^~]?\d[\w.\-]*)"',                                      # package.json
 ]
+
+
+def _spec(v):
+    """'==3.5.1' -> '3.5.1' (an exact pin); '>= 3.5.1' -> '>=3.5.1' (a range stays a range, never shown as a pin)."""
+    v = re.sub(r"\s+", "", v)
+    return v[2:] if v.startswith("==") and "," not in v else v
 
 
 
@@ -233,7 +239,11 @@ def pinned_versions(workdir):
             text = f.read_text(errors="ignore")
             for rx in PINS:
                 for name, ver in re.findall(rx, text, re.M):
-                    pins.setdefault(name.lower(), ver)
+                    pins.setdefault(name.lower(), _spec(ver))
+            if f.name == "pom.xml":  # every <properties> entry, so ${spark.ver}-style refs resolve too
+                for block in re.findall(r"<properties>(.*?)</properties>", text, re.S):
+                    for name, val in re.findall(r"<([\w.\-]+)>([^<]+)</\1>", block):
+                        pins.setdefault(name.lower(), val.strip())
     # Maven / Gradle deps often say ${flink.version}; resolve those from the <properties> pins
     for name, ver in pins.items():
         ref = re.fullmatch(r"\$\{([\w.\-]+)\}", ver.strip())
@@ -250,21 +260,26 @@ def docs_text(workdir):
 
 
 SPARK_VERSION_RX = [  # first hit wins; Python, then Scala/Java, then free-form (README, Dockerfile, submit scripts)
-    r"""pyspark(?:\[[\w,]+\])?\s*(?:==|>=|~=|<=|<|>)\s*([\d][\w.]*)""",
-    r"""['"]pyspark['"]\s*,?\s*(?:version\s*=\s*)?['"]?\s*[\^~=<>]*\s*(\d[\w.]*)""",
+    r"""pyspark(?:\[[\w,]+\])?\s*((?:==|>=|~=|<=|<|>)\s*\d[\w.]*)""",
+    r"""['"]pyspark['"]\s*,?\s*(?:version\s*=\s*)?['"]?\s*([\^~=<>]*\s*\d[\w.]*)""",
     r"""org\.apache\.spark["']?\s*%+\s*["']spark-[\w\-]+["']\s*%\s*["'](\d[\w.\-]*)["']""",  # sbt
     r"""org\.apache\.spark:spark-[\w\-.]+:(\d[\w.\-]*)""",                                   # gradle / --packages
+    r"""<groupId>org\.apache\.spark</groupId>\s*<artifactId>[^<]+</artifactId>\s*<version>([^<]+)</version>""",  # maven dep
     r"""<spark[\w.\-]*version>(\d[^<]*)</""",                                                # maven property
     r"""\bspark_?[vV]ersion\s*(?::=|=|:)\s*["'](\d[\w.\-]*)["']""",                          # sbt val / TOML / yaml
     r"""(?i)\bspark[\s\-_]*(?:version\s*)?v?(\d\.\d+\.\d+)""",                               # README / Dockerfile prose
 ]
 
 
-def spark_version(text):
+def spark_version(text, pins=None):
     for rx in SPARK_VERSION_RX:
-        m = re.search(rx, text)
-        if m:
-            return m.group(1)
+        for m in re.finditer(rx, text):
+            ver = m.group(1).strip()
+            ref = re.fullmatch(r"\$\{([\w.\-]+)\}", ver)
+            if ref:  # <version>${spark.version}</version>
+                ver = (pins or {}).get(ref.group(1).lower(), "")
+            if ver and not ver.startswith("$"):
+                return _spec(ver)
     return None
 
 
@@ -342,14 +357,15 @@ def inspect_answer(ans):
     libs, candidates = set(), collections.defaultdict(list)
     for i, c in enumerate(comps):
         name = str(c["name"])
-        ver = re.match(r"v?(\d[\w.\-+]*)", str(c.get("version") or "").strip())  # skip "bundled with Spark"
+        ver = re.match(r"((?:==|>=|~=|<=|!=|<|>|\^|~)?\s*)v?(\d[\w.\-+]*)",
+                       str(c.get("version") or "").strip())  # skip "bundled with Spark"
         # code regexes catch `pyspark` / `confluent-kafka`; the bare label catches prose like "Apache Spark"
         hits = {label for rx, label in LIBS.items()
                 if re.search(rx, name, re.I) or re.search(rf"\b{re.escape(label)}\b", name, re.I)}
         libs |= hits
         for label in hits:
             if ver:
-                candidates[label].append((len(hits), i, ver.group(1)))
+                candidates[label].append((len(hits), i, _spec(ver.group(1) + ver.group(2))))
     # A component that hits several labels is usually a connector (spark-sql-kafka, flink-connector-kafka),
     # so for each label prefer a component that hits only that label, then the first one listed.
     tool_versions = {label: min(cs)[2] for label, cs in candidates.items()}
@@ -384,18 +400,20 @@ def summarize(stream, workdir, style="build"):
                         shell_cmds.append(c.get("input", {}).get("command", ""))
         elif ev.get("type") == "result":
             result = ev
-    answer = None
+    answer, invalid = None, False
     if style == "ask":
         answer = parse_answer(result.get("result") or "")
-        langs, libs, tool_versions, pins = inspect_answer(answer) if answer else ({}, [], {}, {})
+        invalid = not (isinstance(answer, dict) and isinstance(answer.get("components"), list))
+        langs, libs, tool_versions, pins = ({}, [], {}, {}) if invalid else inspect_answer(answer)
         spark_v = tool_versions.get("Spark")
     else:
         langs, libs = inspect_project(workdir)
         pins, docs = pinned_versions(workdir), docs_text(workdir)
-        spark_v = spark_version(docs) if "Spark" in libs else None
+        spark_v = spark_version(docs, pins) if "Spark" in libs else None
         tool_versions = {lib: v for lib in libs if (v := tool_version(lib, pins, docs, spark_v))}
     return {
         "answer": answer,  # ask style: the parsed JSON (None if it didn't answer in JSON)
+        "invalid_answer": invalid,  # ask style: no usable JSON; not an observation, kept out of the stats
         "languages": langs,
         "libraries": libs,
         "tool_versions": tool_versions,  # LIBS label -> version, for every detected library we found a version for
@@ -403,7 +421,7 @@ def summarize(stream, workdir, style="build"):
         "spark_version": spark_v,
         "tools": dict(tools.most_common()),
         "shell_commands": shell_cmds,
-        "ok": bool(result) and not result.get("is_error", True),
+        "ok": bool(result) and not result.get("is_error", True) and not invalid,
         "api_ms": result.get("duration_api_ms"),
         "cost_usd": result.get("total_cost_usd"),
         "usage": result.get("usage", {}),
@@ -430,17 +448,22 @@ def run_one(run, model, root, timeout):
         stream = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         err, status = "", "TIMEOUT"
     (wd.parent / f"{wd.name}.stream.jsonl").write_text(stream)
+    summary = summarize(stream, wd, run["style"])
+    if summary["invalid_answer"]:
+        status += ", invalid answer"
     return {"task": run["task"], "variant": run["variant"], "style": run["style"], "mode": run["mode"],
             "preferred": run["preferred"], "model": model, "status": status, "wall_s": round(time.time() - t0),
-            **summarize(stream, wd, run["style"]), "stderr": err[-400:]}
+            **summary, "stderr": err[-400:]}
 
 
 def primary_language(r):
-    return next(iter(r["languages"]), "-")
+    return "INVALID ANSWER" if r.get("invalid_answer") else next(iter(r["languages"]), "-")
 
 
 def preferred_cell(r):
     """'Spark 3.5.1, Kafka unpinned' / 'vLLM NOT USED' for a prefer-mode run."""
+    if r.get("invalid_answer"):
+        return "INVALID ANSWER"
     return ", ".join(f"{t} {r['tool_versions'].get(t) or 'unpinned'}" if t in r["libraries"] else f"{t} NOT USED"
                      for t in r["preferred"]) or "-"
 
@@ -460,6 +483,7 @@ def col(g, rs):
 def report(results):
     groups = list(dict.fromkeys((r["task"], r["variant"]) for r in results))
     by_group = {g: [r for r in results if (r["task"], r["variant"]) == g] for g in groups}
+    valid = {g: [r for r in rs if not r.get("invalid_answer")] for g, rs in by_group.items()}  # stats skip these
     models = list(dict.fromkeys(r["model"] for r in results))
     cell = {(r["task"], r["variant"], r["model"]): r for r in results}
     get = lambda g, m: cell.get((*g, m))
@@ -469,12 +493,13 @@ def report(results):
     if prefer:
         lines += ["## Prefer mode: versions of the tools we asked for", "",
                   "`NOT USED` means the agent ignored the instruction; `unpinned` means it used the tool "
-                  "without a version we could find.", ""]
+                  "without a version we could find; a range like `>=3.5` is shown as a range. `INVALID ANSWER` "
+                  "(ask style) means the reply had no usable JSON; those runs are left out of the counts.", ""]
         lines += pivot(models, prefer, lambda g: f"{col(g, by_group[g])} ({', '.join(by_group[g][0]['preferred'])})",
                        lambda g, m: preferred_cell(get(g, m)) if get(g, m) else "")
         spread = collections.defaultdict(collections.Counter)
         for g in prefer:
-            for r in by_group[g]:
+            for r in valid[g]:
                 for t in r["preferred"]:
                     spread[t + (" [ask]" if r.get("style") == "ask" else "")][r["tool_versions"].get(t, "unpinned") if t in r["libraries"] else "NOT USED"] += 1
         lines += ["", "### Version spread across all prefer-mode runs", ""]
@@ -485,13 +510,13 @@ def report(results):
     if floating:
         lines += ["## Float mode: primary language", ""]
         lines += pivot(models, floating, lambda g: col(g, by_group[g]), lambda g, m: primary_language(get(g, m)) if get(g, m) else "")
-        counts = {g: collections.Counter(lib for r in by_group[g] for lib in r["libraries"]) for g in floating}
+        counts = {g: collections.Counter(lib for r in valid[g] for lib in r["libraries"]) for g in floating}
         libs = sorted({lib for c in counts.values() for lib in c}, key=lambda l: -sum(c[l] for c in counts.values()))
         lines += ["", "## Float mode: library use by task (models using it / models run)", "",
                   "| library | " + " | ".join(col(g, by_group[g]) for g in floating) + " |", "|---" * (len(floating) + 1) + "|"]
         for lib in libs:
             lines.append(f"| {lib} | " + " | ".join(
-                f"{counts[g][lib]}/{len(by_group[g])}" if counts[g][lib] else "" for g in floating) + " |")
+                f"{counts[g][lib]}/{len(valid[g])}" if counts[g][lib] else "" for g in floating) + " |")
         lines.append("")
 
     for g in groups:
@@ -639,6 +664,10 @@ def main():
               + (f" preferred: {preferred_cell(r)}" if r["preferred"] else ""), flush=True)
         results.append(r)
         write_tally(tally, results)
+        done.add((run["task"], run["variant"], m))
+        (root / "results.json").write_text(json.dumps(results, indent=1))
+        (root / "report.md").write_text(report(results))
+    if results:  # also repairs exports when a resumed run had nothing left to do
         (root / "results.json").write_text(json.dumps(results, indent=1))
         (root / "report.md").write_text(report(results))
     print(f"\nDONE. {root}/report.md")
