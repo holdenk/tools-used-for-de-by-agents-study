@@ -191,22 +191,33 @@ SKIP = {".git", ".cursor", ".venv", "venv", "node_modules", "__pycache__", "targ
 
 DEP_FILES = {"requirements.txt", "pyproject.toml", "build.sbt", "pom.xml", "build.gradle",
              "build.gradle.kts", "Cargo.toml", "go.mod", "package.json"}
+# a version spec: optional operator, a version (wildcards allowed), then any ", <op> <version>" clauses
+OP = r"(?:===|==|>=|~=|<=|!=|<|>|\^|~|=)"
+SPEC = rf"{OP}?\s*v?\d[\w.\-+*]*(?:\s*,\s*{OP}\s*v?[\w.\-+*]+)*"
 PINS = [  # each yields (name, version)
-    r"""^\s*["']?([A-Za-z][\w.\-]*)(?:\[[\w,]+\])?\s*((?:==|>=|~=|<=|!=|<|>)\s*[\w.*]+(?:\s*,\s*(?:==|>=|~=|<=|!=|<|>)\s*[\w.*]+)*)""",  # pip
+    rf"""^\s*["']?([A-Za-z][\w.\-]*)(?:\[[\w,]+\])?\s*((?:===|==|>=|~=|<=|!=|<|>)\s*v?\d[\w.\-+*]*(?:\s*,\s*{OP}\s*v?[\w.\-+*]+)*)""",  # pip
     r'"[\w.\-]+"\s*%%?\s*"([\w.\-]+)"\s*%\s*"([\w.\-]+)"',                              # sbt
     r"<artifactId>([\w.\-]+)</artifactId>\s*<version>([^<]+)</version>",                # maven dep
     r"<([\w.\-]+version)>(\d[^<]*)</",                                                  # maven prop (not bare <version>)
     r"""["']([\w.\-]+:[\w.\-]+):(\d[\w.\-]*)["']""",                                    # gradle
-    r'^\s*([\w\-]+)\s*=\s*"(\d[\w.\-]*)"',                                              # Cargo
+    rf'^\s*([\w\-]+)\s*=\s*(?:\{{[^}}\n]*?version\s*=\s*)?"({SPEC})"',                       # Cargo / poetry
     r"^\s*([\w./\-]+)\s+(v\d[\w.\-]*)",                                                 # go.mod
     r'"(@?[\w./\-]+)"\s*:\s*"([\^~]?\d[\w.\-]*)"',                                      # package.json
 ]
 
 
-def _spec(v):
-    """'==3.5.1' -> '3.5.1' (an exact pin); '>= 3.5.1' -> '>=3.5.1' (a range stays a range, never shown as a pin)."""
+def _spec(v, cargo=False):
+    """Normalize a version spec so only an exact pin is shown as a bare version.
+
+    '==3.5.1' -> '3.5.1'; '>= 3.5.1, <4' -> '>=3.5.1,<4'; '==3.5.*' stays (a wildcard is a range);
+    'v2.10' -> '2.10'. In Cargo.toml a bare '0.40.0' means '^0.40.0' and '=0.40.0' is the exact pin.
+    """
     v = re.sub(r"\s+", "", v)
-    return v[2:] if v.startswith("==") and "," not in v else v
+    v = re.sub(r"^([=<>!~^]*)v(?=\d)", r"\1", v)
+    if cargo and re.match(r"\d", v):
+        return "^" + v
+    exact = re.fullmatch(r"(?:===|==|=)?(\d[\w.\-+]*)", v)  # one exact version, no wildcard, no range
+    return exact.group(1) if exact else v
 
 
 
@@ -239,7 +250,7 @@ def pinned_versions(workdir):
             text = f.read_text(errors="ignore")
             for rx in PINS:
                 for name, ver in re.findall(rx, text, re.M):
-                    pins.setdefault(name.lower(), _spec(ver))
+                    pins.setdefault(name.lower(), _spec(ver, cargo=f.name == "Cargo.toml"))
             if f.name == "pom.xml":  # every <properties> entry, so ${spark.ver}-style refs resolve too
                 for block in re.findall(r"<properties>(.*?)</properties>", text, re.S):
                     for name, val in re.findall(r"<([\w.\-]+)>([^<]+)</\1>", block):
@@ -260,8 +271,8 @@ def docs_text(workdir):
 
 
 SPARK_VERSION_RX = [  # first hit wins; Python, then Scala/Java, then free-form (README, Dockerfile, submit scripts)
-    r"""pyspark(?:\[[\w,]+\])?\s*((?:==|>=|~=|<=|<|>)\s*\d[\w.]*)""",
-    r"""['"]pyspark['"]\s*,?\s*(?:version\s*=\s*)?['"]?\s*([\^~=<>]*\s*\d[\w.]*)""",
+    rf"""pyspark(?:\[[\w,]+\])?\s*((?:===|==|>=|~=|<=|!=|<|>)\s*v?\d[\w.\-+*]*(?:\s*,\s*{OP}\s*v?[\w.\-+*]+)*)""",
+    rf"""['"]pyspark['"]\s*,?\s*(?:version\s*=\s*)?['"]?\s*({SPEC})""",
     r"""org\.apache\.spark["']?\s*%+\s*["']spark-[\w\-]+["']\s*%\s*["'](\d[\w.\-]*)["']""",  # sbt
     r"""org\.apache\.spark:spark-[\w\-.]+:(\d[\w.\-]*)""",                                   # gradle / --packages
     r"""<groupId>org\.apache\.spark</groupId>\s*<artifactId>[^<]+</artifactId>\s*<version>([^<]+)</version>""",  # maven dep
@@ -272,6 +283,8 @@ SPARK_VERSION_RX = [  # first hit wins; Python, then Scala/Java, then free-form 
 
 
 def spark_version(text, pins=None):
+    if pins and pins.get("pyspark"):  # a parsed dependency pin beats any pattern over prose
+        return pins["pyspark"]
     for rx in SPARK_VERSION_RX:
         for m in re.finditer(rx, text):
             ver = m.group(1).strip()
@@ -357,15 +370,14 @@ def inspect_answer(ans):
     libs, candidates = set(), collections.defaultdict(list)
     for i, c in enumerate(comps):
         name = str(c["name"])
-        ver = re.match(r"((?:==|>=|~=|<=|!=|<|>|\^|~)?\s*)v?(\d[\w.\-+]*)",
-                       str(c.get("version") or "").strip())  # skip "bundled with Spark"
+        ver = re.match(SPEC, str(c.get("version") or "").strip())  # skips "bundled with Spark"
         # code regexes catch `pyspark` / `confluent-kafka`; the bare label catches prose like "Apache Spark"
         hits = {label for rx, label in LIBS.items()
                 if re.search(rx, name, re.I) or re.search(rf"\b{re.escape(label)}\b", name, re.I)}
         libs |= hits
         for label in hits:
             if ver:
-                candidates[label].append((len(hits), i, _spec(ver.group(1) + ver.group(2))))
+                candidates[label].append((len(hits), i, _spec(ver.group(0))))
     # A component that hits several labels is usually a connector (spark-sql-kafka, flink-connector-kafka),
     # so for each label prefer a component that hits only that label, then the first one listed.
     tool_versions = {label: min(cs)[2] for label, cs in candidates.items()}
