@@ -18,12 +18,17 @@ report which tools it used, and is inspected for languages, libraries and versio
 Writes <out>/report.md and <out>/results.json, and keeps a CSV tally that a rerun
 restores from, so no (task, variant, model, repeat) runs twice.
 
+A run that stops because the agent CLI is out of quota is logged but never recorded,
+so a rerun redoes it. The bakeoff pauses (--quota-wait, 24h) and retries that run, up to
+--quota-retries (10) times, then stops with exit code 75.
+
 A task is just a prompt file: prompts/<task>.md, with a `{tooling}` line the mode
 fills in and an optional `prefer: Tool, Tool` front-matter header.
 """
 import argparse
 import collections
 import csv
+import functools
 import hashlib
 import io
 import json
@@ -558,6 +563,84 @@ def summarize(stream: str, workdir: Path, style: str = "build") -> Result:
     }
 
 
+# --- out of quota: the agent CLI stopped because its account hit a limit, not because of anything in the task
+QUOTA_RX = re.compile(
+    r"usage limit|rate[ _-]?limit|quota|too many requests|\b(?:error|status|code)\W{0,3}429\b|hit your [\w ]{0,30}limit"
+    r"|\b(?:session|weekly|daily|monthly|spend(?:ing)?|plan|opus|sonnet) limit\b"
+    r"|out of (?:extra usage|usage|credits?)|credit balance|insufficient (?:credits?|balance|funds)", re.I)
+QUOTA_WARNING_RX = re.compile(r"approaching|you've used \d|close to|now using extra usage", re.I)  # still running
+QUOTA_ERRORS = {"rate_limit", "billing_error"}  # Claude Code's `error` on the assistant message a run ends with
+QUOTA_EXIT = 75  # EX_TEMPFAIL from sysexits.h: try again later
+
+
+class QuotaExhausted(Exception):
+    """The agent CLI stopped because its account is out of quota (usage limit, rate limit, no credits)."""
+
+
+def quota_error(stream: str, stderr: str, returncode: int | None) -> str | None:
+    """Why a run stopped on quota, or None. Only a run that failed counts (non-zero exit or timeout, no result, or
+    an error result), and only what the CLI itself said: stderr, non-JSON stdout, an error result or error event,
+    or Claude Code's rate_limit / billing_error message. Never the agent's own messages, which can talk about
+    rate limits as part of the task."""
+    texts: list[str] = []
+    flagged: str | None = None
+    result: dict[str, Any] | None = None
+    for line in stream.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            ev = None
+        if not isinstance(ev, dict):
+            if not line.lstrip().startswith("{"):  # a cut-off event (a timeout mid-write) is still the agent's
+                texts.append(line)  # not an event: the CLI talking, not the agent
+        elif ev.get("type") == "result":
+            result = ev
+        elif ev.get("type") == "error":
+            texts.append(json.dumps(ev))
+        elif ev.get("type") == "assistant" and ev.get("error"):
+            content = (ev.get("message") or {}).get("content") or []
+            text = " ".join(str(c.get("text") or "") for c in content if isinstance(c, dict)).strip()
+            if ev["error"] in QUOTA_ERRORS:
+                flagged = flagged or text or str(ev["error"])
+            texts.append(text)
+    if returncode == 0 and result is not None and not result.get("is_error"):
+        return None  # a finished run, whatever it said along the way
+    if flagged:
+        return flagged
+    if result is not None and result.get("is_error"):
+        texts += [str(result.get("result") or ""), json.dumps(result.get("errors") or "")]
+    for line in "\n".join([*texts, stderr]).splitlines():
+        if QUOTA_RX.search(line) and not QUOTA_WARNING_RX.search(line):
+            return line.strip()[:300]
+    return None
+
+
+def clock(t: float | None = None) -> str:
+    """Local wall-clock time for log lines that span days: '2026-11-24 14:05 PST'."""
+    return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(t))
+
+
+def run_with_quota_retries(attempt: Callable[[], Result], header: str, retries: int, wait_hours: float,
+                           sleep: Callable[[float], None] = time.sleep) -> Result | None:
+    """attempt()'s result. Each time it stops on quota, log it, pause wait_hours, then try again, up to `retries`
+    times; None once they're used up. A quota-stopped attempt returns nothing, so it's never recorded."""
+    for n in range(retries + 1):
+        print(header + (f" (quota retry {n}/{retries})" if n else "") + " ...", flush=True)
+        try:
+            return attempt()
+        except QuotaExhausted as e:
+            print(f"    {clock()}: OUT OF QUOTA: {e}", flush=True)
+            print("    not recorded, so a rerun with the same --out will redo this run", flush=True)
+            if n == retries:
+                print(f"    still out of quota after {retries} quota retr{'y' if retries == 1 else 'ies'}; "
+                      "giving up", flush=True)
+                return None
+            print(f"    pausing {wait_hours:g}h, until {clock(time.time() + wait_hours * 3600)}, "
+                  f"then quota retry {n + 1} of {retries}", flush=True)
+            sleep(wait_hours * 3600)
+    return None
+
+
 def run_dir_name(model: str, rep: int) -> str:
     """Repeat 1 keeps the plain model name, so tallies and dirs from before --repeats line up."""
     return re.sub(r"[^\w.\-]", "_", model) + ("" if rep == 1 else f".rep{rep}")
@@ -575,14 +658,18 @@ def run_one(run: Run, model: str, root: Path, timeout: int, rep: int = 1) -> Res
                "--output-format", "stream-json", "--workspace", str(wd), prompt]
     t0 = time.time()
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0))  # for version lag vs releases at run time
+    code: int | None
     try:
         p = subprocess.run(cmd, cwd=wd, capture_output=True, text=True, timeout=timeout)
-        stream, err, status = p.stdout, p.stderr, f"exit {p.returncode}"
+        stream, err, status, code = p.stdout, p.stderr, f"exit {p.returncode}", p.returncode
     except subprocess.TimeoutExpired as e:
         stream = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err, status = "", "TIMEOUT"
-    (wd.parent / f"{wd.name}.stream.jsonl").write_text(stream)
+        err, status, code = "", "TIMEOUT", None
+    stream_file = wd.parent / f"{wd.name}.stream.jsonl"
+    stream_file.write_text(stream)
     (wd.parent / f"{wd.name}.prompt.txt").write_text(prompt)
+    if reason := quota_error(stream, err, code):
+        raise QuotaExhausted(f"{reason} (stream in {stream_file})")
     summary = summarize(stream, wd, run["style"])
     if summary["invalid_answer"]:
         status += ", invalid answer"
@@ -1023,6 +1110,12 @@ def main() -> int:
     ap.add_argument("--match", help="regex filter on the model list (e.g. 'sonnet|opus')")
     ap.add_argument("--no-extras", action="store_true", help="skip the cortex + claude runs at the end")
     ap.add_argument("--timeout", type=int, default=3600, help="per-run seconds")
+    ap.add_argument("--quota-wait", type=float, default=24,
+                    help="hours to pause when an agent CLI is out of quota, before retrying that run "
+                         "(default %(default)g). Quota-stopped runs are never recorded, so a rerun redoes them")
+    ap.add_argument("--quota-retries", type=int, default=10,
+                    help="how many times to pause and retry a run that keeps hitting the quota before stopping "
+                         "with exit code 75 (default %(default)s; 0 stops at the first quota error)")
     ap.add_argument("--repeats", type=int, default=3,
                     help="runs per (task, variant, model) (default %(default)s), to measure how consistent each "
                          "model's choices are. "
@@ -1057,6 +1150,8 @@ def main() -> int:
         models = [m for m in models if re.search(a.match, m)]
     if a.repeats < 1:
         sys.exit("--repeats must be at least 1")
+    if a.quota_wait < 0 or a.quota_retries < 0:
+        sys.exit("--quota-wait and --quota-retries can't be negative")
     todo = [(run, m, rep) for rep in range(1, a.repeats + 1) for run in runs for m in models]
     if a.dry_run:
         for run, m, rep in todo:
@@ -1071,14 +1166,21 @@ def main() -> int:
         added = sync_shared(shared, results, out)
         if added:
             print(f"added {added} earlier run(s) from {tally} to {shared}", flush=True)
+    out_of_quota: str | None = None  # the model we gave up on, and how many runs that left undone
+    left = 0
     for i, (run, m, rep) in enumerate(todo, 1):
         key = (run["task"], run["variant"], m, rep)
         label = f"{run['task']} / {run['variant']} / {m}" + (f" #{rep}" if rep > 1 else "")
         if key in done:
             print(f"[{i}/{len(todo)}] {label} already in {tally}, skipping", flush=True)
             continue
-        print(f"[{i}/{len(todo)}] {label} ...", flush=True)
-        r = run_one(run, m, root, a.timeout, rep)
+        maybe = run_with_quota_retries(functools.partial(run_one, run, m, root, a.timeout, rep),
+                                       f"[{i}/{len(todo)}] {label}", a.quota_retries, a.quota_wait)
+        if maybe is None:
+            out_of_quota = m
+            left = sum((t["task"], t["variant"], tm, trep) not in done for t, tm, trep in todo[i - 1:])
+            break
+        r = maybe
         r["harness_commit"] = harness
         print(f"    {r['status']} {r['wall_s']}s langs={list(r['languages'])} libs={r['libraries']}"
               + (f" preferred: {preferred_cell(r)}" if r["preferred"] else ""), flush=True)
@@ -1095,6 +1197,11 @@ def main() -> int:
     if results:  # also repairs exports when a resumed run had nothing left to do
         (root / "results.json").write_text(json.dumps(results, indent=1))
         (root / "report.md").write_text(report(results))
+    if out_of_quota:
+        print(f"\nSTOPPED, out of quota: {left} run(s) not done, none of them recorded. Rerun with the same --out "
+              f"to pick them up, or leave {out_of_quota} out with --models or --match. {root}/report.md has the "
+              f"{len(results)} run(s) so far.", flush=True)
+        return QUOTA_EXIT
     print(f"\nDONE. {root}/report.md")
     return 0
 
