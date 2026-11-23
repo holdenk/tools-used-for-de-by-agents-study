@@ -76,6 +76,42 @@ Both modes ask the agent to pin dependency versions.
 Version caveat: for tools with a separate client library, the version recorded is
 usually the client's (e.g. `confluent-kafka 2.6.1` shows up as `Kafka 2.6.1`).
 
+## Repeats and convergence
+
+One run per model shows what a model picked once, not what it usually picks.
+`--repeats N` runs every (task, variant, model) N times. Repeat 1 runs everywhere
+first, so a run cut short still covers every cell. The report then adds a
+**Convergence** table per (task, variant):
+
+- **top stack**: the most common exact library set, and its share of runs;
+- **effective stacks**: 2^entropy of the library-set distribution (1 means every
+  run picked the same set);
+- **Jaccard within model / across models**: mean library-set overlap between
+  repeats of one model, and between different models. If `across` is about as high
+  as `within`, the models share a default rather than each having its own;
+- **top answer**: the most common primary language (float) or preferred-tool
+  versions (prefer).
+
+It also lists the libraries that at least half the float runs of *every* task picked:
+a default that doesn't depend on the task. The `tests` label is left out of all of
+these, since every prompt asks for tests.
+
+This borrows its method from Hamilton & Mimno, [*Elias in the Lighthouse, Again?
+Diagnosing Low Diversity in LLM Stories*](https://arxiv.org/abs/2605.26492) (2026).
+They sampled five near-identical story prompts 1,000 times each on four models and
+found a handful of names, jobs and settings ("Elias", "keeper", "lighthouse") in
+88.3% of 20,000 stories, at rates far above human-written fiction. They kept a word
+only if at least half the models produced it. Our questions are the same: is there
+an "Elias in the Lighthouse" stack or Spark version that agents keep landing on,
+across models and tasks? How far is it from what the task needs and from what
+people actually use?
+
+Build runs are expensive, so for large N use `--style ask`, the same way the paper
+used small models to afford more samples. Each run also records when it started
+(`started`) and the model the CLI reported (`served_model`, e.g. what plain
+`claude` resolved to), so a pin can later be compared against releases on that day
+and against the model's training cutoff.
+
 ## Adding a task
 
 Drop in `prompts/<task>.md`; the file name is the task name. Put a `{tooling}` line
@@ -116,6 +152,10 @@ python3 agent_bakeoff.py --out bakeoff --mode prefer --prefer Flink,Kafka --task
 python3 agent_bakeoff.py --out bakeoff-ask --style ask --models claude:haiku,claude:sonnet
 ```
 
+```bash
+python3 agent_bakeoff.py --out bakeoff-ask --style ask --mode float --repeats 20 --tasks raincloud_tpch_mart_small,raincloud_tpch_mart_large
+```
+
 - `--models` takes Cursor model names plus `cortex` and `claude`. Use
   `claude:<model>` (e.g. `claude:haiku`) to pick the Claude Code model.
 
@@ -124,12 +164,16 @@ python3 agent_bakeoff.py --out bakeoff-ask --style ask --models claude:haiku,cla
   doesn't collide with default-preference runs.
 - Output goes to `<out>/<task>/<variant>/<model>/` (the agent's workspace) and
   `<out>/<task>/<variant>/<model>.stream.jsonl` (its raw stream). The variant is
-  `float` or `prefer-<tools>`.
+  `float` or `prefer-<tools>`. Repeats after the first go to `<model>.rep<N>/`.
 - `<out>/report.md` has the prefer-mode version tables, the float-mode tool tables,
-  then per-(task, variant) details. `<out>/results.json` has everything.
+  the convergence table, then per-(task, variant) details. With repeats, a pivot
+  cell lists each distinct answer with its count (`Spark 3.5.1 ×3; Spark 4.0.1 ×1`).
+  `<out>/results.json` has everything.
 - `<out>/tally.csv` is the resume point: rerun with the same `--out` and any
-  (task, variant, model) already in it is skipped. Tallies from before tasks and
-  modes existed load as `poi_s2 / legacy` (the old "Spark preferred" POI prompt).
+  (task, variant, model, repeat) already in it is skipped, so raising `--repeats`
+  adds only the new repeats. Rows from before `--repeats` count as repeat 1.
+  Tallies from before tasks and modes existed load as `poi_s2 / legacy` (the old
+  "Spark preferred" POI prompt).
 
 Compare two runs (e.g. to see how stable a model's choices are):
 
@@ -137,5 +181,15 @@ Compare two runs (e.g. to see how stable a model's choices are):
 python3 -I compare_runs.py bakeoff-run1 bakeoff-run2
 ```
 
-In prefer mode it compares the preferred tools' versions; in float mode it compares
-primary language, Spark version and library set.
+It pairs runs by (task, variant, model, repeat). In prefer mode it compares the
+preferred tools' versions; in float mode it compares primary language, Spark
+version and library set.
+
+## References
+
+- Sil Hamilton and David Mimno. 2026. *Elias in the Lighthouse, Again? Diagnosing
+  Low Diversity in LLM Stories.* arXiv:2605.26492. <https://arxiv.org/abs/2605.26492>
+  The source of the repeated-sampling and convergence measures above.
+- [Raincloud](https://github.com/spiraldb/raincloud), SpiralDB's harness for data
+  management research datasets. The `raincloud_*` tasks take their inputs, sizes
+  and schemas from its catalog.

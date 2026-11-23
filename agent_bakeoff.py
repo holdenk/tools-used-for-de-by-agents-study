@@ -12,10 +12,11 @@ Two styles:
             libraries and versions it WOULD use, and we inspect that answer.
 
 Each (task, variant, model) gets a fresh directory <out>/<task>/<variant>/<model>/
-(variant is `float` or `prefer-<tools>`, prefixed `ask-` for ask style), runs with --yolo and stream-json so we can
+(variant is `float` or `prefer-<tools>`, prefixed `ask-` for ask style; repeats past the first, from --repeats,
+get <model>.rep<N>/), runs with --yolo and stream-json so we can
 report which tools it used, and is inspected for languages, libraries and versions.
 Writes <out>/report.md and <out>/results.json, and keeps a CSV tally that a rerun
-restores from, so no (task, variant, model) runs twice.
+restores from, so no (task, variant, model, repeat) runs twice.
 
 A task is just a prompt file: prompts/<task>.md, with a `{tooling}` line the mode
 fills in and an optional `prefer: Tool, Tool` front-matter header.
@@ -24,6 +25,7 @@ import argparse
 import collections
 import csv
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -460,7 +462,7 @@ def inspect_answer(ans):
 
 def summarize(stream, workdir, style="build"):
     """Cursor: `started` tool_call events (key = tool). Others: tool_use blocks."""
-    tools, shell_cmds, result = collections.Counter(), [], {}
+    tools, shell_cmds, result, served = collections.Counter(), [], {}, None
     for line in stream.splitlines():
         try:
             ev = json.loads(line)
@@ -478,6 +480,8 @@ def summarize(stream, workdir, style="build"):
                     tools[c["name"].lower()] += 1
                     if c["name"].lower() in ("bash", "shell"):
                         shell_cmds.append(c.get("input", {}).get("command", ""))
+        elif ev.get("type") == "system" and ev.get("subtype") == "init" and ev.get("model"):
+            served = served or ev["model"]  # what actually ran, e.g. when `claude` uses its default model
         elif ev.get("type") == "result":
             result = ev
     answer, invalid = None, False
@@ -509,11 +513,17 @@ def summarize(stream, workdir, style="build"):
         "usage": result.get("usage", {}),
         "files": len(project_files(workdir)),
         "final": (result.get("result") or "")[-600:],
+        "served_model": served,  # from the stream's init event, when the CLI reports one
     }
 
 
-def run_one(run, model, root, timeout):
-    wd = root / run["task"] / run["variant"] / re.sub(r"[^\w.\-]", "_", model)
+def run_dir_name(model, rep):
+    """Repeat 1 keeps the plain model name, so tallies and dirs from before --repeats line up."""
+    return re.sub(r"[^\w.\-]", "_", model) + ("" if rep == 1 else f".rep{rep}")
+
+
+def run_one(run, model, root, timeout, rep=1):
+    wd = root / run["task"] / run["variant"] / run_dir_name(model, rep)
     shutil.rmtree(wd, ignore_errors=True)  # partial dir from a crashed run
     wd.mkdir(parents=True)
     prompt = run["prompt"]
@@ -523,6 +533,7 @@ def run_one(run, model, root, timeout):
         cmd = ["agent", "-p", "--yolo", "--trust", "--model", model,
                "--output-format", "stream-json", "--workspace", str(wd), prompt]
     t0 = time.time()
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0))  # for version lag vs releases at run time
     try:
         p = subprocess.run(cmd, cwd=wd, capture_output=True, text=True, timeout=timeout)
         stream, err, status = p.stdout, p.stderr, "exit %d" % p.returncode
@@ -534,7 +545,8 @@ def run_one(run, model, root, timeout):
     if summary["invalid_answer"]:
         status += ", invalid answer"
     return {"task": run["task"], "variant": run["variant"], "style": run["style"], "mode": run["mode"],
-            "preferred": run["preferred"], "model": model, "status": status, "wall_s": round(time.time() - t0),
+            "preferred": run["preferred"], "model": model, "rep": rep, "started": started, "status": status,
+            "wall_s": round(time.time() - t0),
             **summary, "stderr": err[-400:]}
 
 
@@ -571,13 +583,92 @@ def col(g, rs):
     return g[0] + (" [ask]" if rs[0].get("style") == "ask" else "")
 
 
+def run_label(r):
+    rep = r.get("rep") or 1
+    return r["model"] + ("" if rep == 1 else f" #{rep}")
+
+
+def tally_cell(values):
+    """One repeat: its value. Several: 'Spark 3.5.1 ×3; Spark 4.0.0 ×1', most common first."""
+    if len(values) == 1:
+        return values[0]
+    return "; ".join(f"{v} ×{n}" for v, n in collections.Counter(values).most_common())
+
+
+# --- convergence: do runs keep landing on the same stack? (cf. "Elias in the Lighthouse, Again?",
+# arXiv 2605.26492: the same prompt, sampled many times, collapses onto a few defaults)
+NOT_A_CHOICE = {"tests"}  # every prompt asks for tests, so this label says nothing about the stack
+
+
+def stack(r):
+    return frozenset(r["libraries"]) - NOT_A_CHOICE
+
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b) if a | b else 1.0
+
+
+def mean_similarity(runs, same_model):
+    """Mean pairwise Jaccard of library sets, over pairs from the same model (repeats) or from different models."""
+    sims = [jaccard(stack(x), stack(y)) for i, x in enumerate(runs) for y in runs[i + 1:]
+            if (x["model"] == y["model"]) == same_model]
+    return f"{sum(sims) / len(sims):.2f}" if sims else "-"
+
+
+def effective_choices(counter):
+    """2^entropy: 1.0 when every run made the same choice, n when n choices were equally common."""
+    n = sum(counter.values())
+    return 2 ** -sum(c / n * math.log2(c / n) for c in counter.values()) if n else 0.0
+
+
+def modal(counter):
+    value, count = counter.most_common(1)[0]
+    return value, f"{count}/{sum(counter.values())}"
+
+
+def convergence(groups, by_group, valid):
+    lines = ["## Convergence: how often runs land on the same stack", "",
+             "Over valid runs, ignoring the `tests` label. **Top stack**: the most common exact library set. "
+             "**Effective stacks**: 2^entropy of the library-set distribution (1 = every run picked the same "
+             "set). **Jaccard**: mean pairwise library-set overlap between repeats of one model, and between "
+             "runs of different models; if `across` is close to `within`, the models share a default. "
+             "**Top answer**: the most common primary language (float) or preferred-tool versions (prefer).", "",
+             "| task / variant | runs | models | top stack | effective stacks | Jaccard within model "
+             "| Jaccard across models | top answer |", "|---|---|---|---|---|---|---|---|"]
+    for g in groups:
+        rs = valid[g]
+        if not rs:
+            continue
+        stacks = collections.Counter(stack(r) for r in rs)
+        top, share = modal(stacks)
+        answer = collections.Counter(preferred_cell(r) if r["preferred"] else primary_language(r) for r in rs)
+        a, a_share = modal(answer)
+        lines.append(f"| {g[0]} / {g[1]} | {len(rs)} | {len({r['model'] for r in rs})} "
+                     f"| {', '.join(sorted(top)) or '-'} ({share}) | {effective_choices(stacks):.1f} "
+                     f"| {mean_similarity(rs, True)} | {mean_similarity(rs, False)} | {a} ({a_share}) |")
+    # task-independent defaults: libraries at least half the float runs of every task picked
+    for style in dict.fromkeys(by_group[g][0].get("style", "build") for g in groups):
+        floating = [g for g in groups if by_group[g][0]["mode"] == "float"
+                    and by_group[g][0].get("style", "build") == style and valid[g]]
+        if len(floating) < 2:
+            continue
+        share = lambda lib, g: sum(lib in stack(r) for r in valid[g]) / len(valid[g])
+        libs = {lib for g in floating for r in valid[g] for lib in stack(r)}
+        core = sorted(lib for lib in libs if all(share(lib, g) >= 0.5 for g in floating))
+        lines += ["", f"Used by at least half the float runs of every task ({style}, {len(floating)} tasks): "
+                      + (", ".join(core) or "none")]
+    return lines + [""]
+
+
 def report(results):
     groups = list(dict.fromkeys((r["task"], r["variant"]) for r in results))
     by_group = {g: [r for r in results if (r["task"], r["variant"]) == g] for g in groups}
     valid = {g: [r for r in rs if not r.get("invalid_answer")] for g, rs in by_group.items()}  # stats skip these
     models = list(dict.fromkeys(r["model"] for r in results))
-    cell = {(r["task"], r["variant"], r["model"]): r for r in results}
-    get = lambda g, m: cell.get((*g, m))
+    cells = collections.defaultdict(list)  # (task, variant, model) -> its runs, one per repeat
+    for r in sorted(results, key=lambda r: r.get("rep") or 1):
+        cells[(r["task"], r["variant"], r["model"])].append(r)
+    shown = lambda g, m, fn: tally_cell([fn(r) for r in cells[(*g, m)]]) if cells.get((*g, m)) else ""
     lines = ["# Agent DE bakeoff", "", f"tasks: {', '.join(dict.fromkeys(t for t, _ in groups))}", ""]
 
     prefer = [g for g in groups if by_group[g][0]["mode"] == "prefer"]
@@ -587,7 +678,7 @@ def report(results):
                   "without a version we could find; a range like `>=3.5` is shown as a range. `INVALID ANSWER` "
                   "(ask style) means the reply had no usable JSON; those runs are left out of the counts.", ""]
         lines += pivot(models, prefer, lambda g: f"{col(g, by_group[g])} ({', '.join(by_group[g][0]['preferred'])})",
-                       lambda g, m: preferred_cell(get(g, m)) if get(g, m) else "")
+                       lambda g, m: shown(g, m, preferred_cell))
         spread = collections.defaultdict(collections.Counter)
         for g in prefer:
             for r in valid[g]:
@@ -600,15 +691,17 @@ def report(results):
     floating = [g for g in groups if by_group[g][0]["mode"] == "float"]
     if floating:
         lines += ["## Float mode: primary language", ""]
-        lines += pivot(models, floating, lambda g: col(g, by_group[g]), lambda g, m: primary_language(get(g, m)) if get(g, m) else "")
+        lines += pivot(models, floating, lambda g: col(g, by_group[g]), lambda g, m: shown(g, m, primary_language))
         counts = {g: collections.Counter(lib for r in valid[g] for lib in r["libraries"]) for g in floating}
         libs = sorted({lib for c in counts.values() for lib in c}, key=lambda l: -sum(c[l] for c in counts.values()))
-        lines += ["", "## Float mode: library use by task (models using it / models run)", "",
+        lines += ["", "## Float mode: library use by task (runs using it / runs)", "",
                   "| library | " + " | ".join(col(g, by_group[g]) for g in floating) + " |", "|---" * (len(floating) + 1) + "|"]
         for lib in libs:
             lines.append(f"| {lib} | " + " | ".join(
                 f"{counts[g][lib]}/{len(valid[g])}" if counts[g][lib] else "" for g in floating) + " |")
         lines.append("")
+
+    lines += convergence(groups, by_group, valid)
 
     for g in groups:
         rs = by_group[g]
@@ -619,10 +712,12 @@ def report(results):
             langs = ", ".join(language_label(r, k) + ("" if v is None else f" ({v} LOC)")
                               for k, v in r["languages"].items()) or "-"
             tv = ", ".join(f"{k} {v}" for k, v in list(r["tool_versions"].items())[:12]) or "-"
-            lines.append(f"| {r['model']} | {r['status']} | {r['wall_s']} | {r['files']} | {langs} "
+            lines.append(f"| {run_label(r)} | {r['status']} | {r['wall_s']} | {r['files']} | {langs} "
                          f"| {', '.join(r['libraries']) or '-'} | {preferred_cell(r)} | {tv} |")
         for r in rs:
-            lines += ["", f"### {g[0]} / {g[1]} / {r['model']}", f"languages: {r['languages']}",
+            lines += ["", f"### {g[0]} / {g[1]} / {run_label(r)}",
+                      f"started: {r.get('started') or '?'}, served model: {r.get('served_model') or '?'}",
+                      f"languages: {r['languages']}",
                       f"language versions: {r.get('language_versions') or {}}",
                       f"libraries: {r['libraries']}", f"tool versions: {r['tool_versions']}",
                       f"pinned: {r['versions']}", f"agent tools: {r['tools']}", f"usage: {r['usage']}"]
@@ -651,6 +746,7 @@ def load_tally(path):
         r["variant"] = r.get("variant") or LEGACY
         r["mode"] = r.get("mode") or LEGACY
         r["style"] = r.get("style") or "build"
+        r["rep"] = r.get("rep") or 1  # rows from before --repeats
         r["preferred"] = r.get("preferred") or []
         r["tool_versions"] = r.get("tool_versions") or (
             {"Spark": r["spark_version"]} if r.get("spark_version") else {})
@@ -713,6 +809,10 @@ def main():
     ap.add_argument("--match", help="regex filter on the model list (e.g. 'sonnet|opus')")
     ap.add_argument("--no-extras", action="store_true", help="skip the cortex + claude runs at the end")
     ap.add_argument("--timeout", type=int, default=3600, help="per-run seconds")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="runs per (task, variant, model), to measure how consistent each model's choices are. "
+                         "All repeat-1 runs go first, then repeat 2, and so on. Raising it on a resumed run adds "
+                         "only the new repeats")
     ap.add_argument("--dry-run", action="store_true", help="print the (task, variant, model) runs and exit")
     ap.add_argument("--print-prompts", action="store_true", help="print each rendered prompt and exit")
     a = ap.parse_args()
@@ -729,7 +829,7 @@ def main():
     root = Path(a.out).resolve()
     tally = Path(a.csv) if a.csv else root / "tally.csv"
     results = load_tally(tally)
-    done = {(r["task"], r["variant"], r["model"]) for r in results}
+    done = {(r["task"], r["variant"], r["model"], r["rep"]) for r in results}
 
     models = a.models.split(",") if a.models else list_models()
     if not a.no_extras and not a.models:
@@ -739,25 +839,29 @@ def main():
         sys.exit(f"only claude takes a :<model> suffix: {', '.join(bad)}")
     if a.match:
         models = [m for m in models if re.search(a.match, m)]
-    todo = [(run, m) for run in runs for m in models]
+    if a.repeats < 1:
+        sys.exit("--repeats must be at least 1")
+    todo = [(run, m, rep) for rep in range(1, a.repeats + 1) for run in runs for m in models]
     if a.dry_run:
-        for run, m in todo:
-            print(f"{run['task']}\t{run['variant']}\t{m}" + ("\t(done)" if (run["task"], run["variant"], m) in done else ""))
+        for run, m, rep in todo:
+            print(f"{run['task']}\t{run['variant']}\t{m}" + (f"\trep {rep}" if a.repeats > 1 else "")
+                  + ("\t(done)" if (run["task"], run["variant"], m, rep) in done else ""))
         return 0
 
     root.mkdir(parents=True, exist_ok=True)
-    for i, (run, m) in enumerate(todo, 1):
-        label = f"{run['task']} / {run['variant']} / {m}"
-        if (run["task"], run["variant"], m) in done:
+    for i, (run, m, rep) in enumerate(todo, 1):
+        key = (run["task"], run["variant"], m, rep)
+        label = f"{run['task']} / {run['variant']} / {m}" + (f" #{rep}" if rep > 1 else "")
+        if key in done:
             print(f"[{i}/{len(todo)}] {label} already in {tally}, skipping", flush=True)
             continue
         print(f"[{i}/{len(todo)}] {label} ...", flush=True)
-        r = run_one(run, m, root, a.timeout)
+        r = run_one(run, m, root, a.timeout, rep)
         print(f"    {r['status']} {r['wall_s']}s langs={list(r['languages'])} libs={r['libraries']}"
               + (f" preferred: {preferred_cell(r)}" if r["preferred"] else ""), flush=True)
         results.append(r)
         write_tally(tally, results)
-        done.add((run["task"], run["variant"], m))
+        done.add(key)
         (root / "results.json").write_text(json.dumps(results, indent=1))
         (root / "report.md").write_text(report(results))
     if results:  # also repairs exports when a resumed run had nothing left to do

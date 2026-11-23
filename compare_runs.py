@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two agent_bakeoff.py runs, per (task, variant, model): python3 -I compare_runs.py RUN1 RUN2
+"""Compare two agent_bakeoff.py runs, per (task, variant, model, repeat): python3 -I compare_runs.py RUN1 RUN2
 
 prefer-mode runs compare the versions of the preferred tools; float (and legacy) runs
 compare primary language (with its version, when an ask run gave one), Spark yes/no+version,
@@ -15,7 +15,7 @@ def load(d):
     for r in json.loads((Path(d) / "results.json").read_text()):
         r.setdefault("preferred", [])  # results from before tasks / modes existed
         r.setdefault("tool_versions", {})
-        out[(r.get("task") or "poi_s2", r.get("variant") or "legacy", r["model"])] = r
+        out[(r.get("task") or "poi_s2", r.get("variant") or "legacy", r["model"], str(r.get("rep") or 1))] = r
     return out
 
 
@@ -37,8 +37,9 @@ def lang(r):
 def main(d1, d2):
     a, b = load(d1), load(d2)
     same = diff = 0
-    print("| task | variant | model | lang run1 | lang run2 | versions run1 | versions run2 | libs only in 1 | libs only in 2 |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    print("| task | variant | model | repeat | lang run1 | lang run2 | versions run1 | versions run2 "
+          "| libs only in 1 | libs only in 2 |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for key in sorted(a.keys() & b.keys()):
         x, y = a[key], b[key]
         o1, o2 = sorted(set(x["libraries"]) - set(y["libraries"])), sorted(set(y["libraries"]) - set(x["libraries"]))
