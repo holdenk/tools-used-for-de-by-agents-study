@@ -17,6 +17,33 @@ pinned versions and agent tools each one used.
 | `nyc_taxi_lakehouse` | Bronze / silver / gold lakehouse over the full NYC TLC trip history, with schema drift and quarantine | Spark, Iceberg |
 | `entity_resolution` | Deduplicate and link customer records across three sources with no shared ID, with ground-truth evaluation | Spark |
 | `point_in_time_features` | Point-in-time correct churn features: leakage-free backfill plus a daily incremental that matches it | Spark |
+| `raincloud_tpch_mart_small` | TPC-H SF1 (8.7M rows) from Raincloud into a sales mart, on one small VM | Spark, Raincloud |
+| `raincloud_tpch_mart_large` | The same mart at TPC-H SF100 (866M rows), on a cluster | Spark, Raincloud |
+| `raincloud_air_quality_small` | Hourly Beijing air quality (420K rows) into daily AQI tables and pollution episodes | Spark, Raincloud |
+| `raincloud_ghcn_climate_large` | NOAA GHCN-Daily (3.19B rows) into climate normals, anomalies and heat waves | Spark, Raincloud |
+
+## Small vs large: the Raincloud tasks
+
+The other tasks are all "doesn't fit on one machine". The `raincloud_*` tasks come
+in small / large pairs, so we can see whether an agent's stack follows the data size.
+Their inputs are real datasets from [Raincloud](https://github.com/spiraldb/raincloud),
+so the sizes in the prompts come from its catalog rather than being made up.
+
+- **TPC-H mart** (`_small` / `_large`): the prompts differ only in the input and
+  scale bullets (SF1 on a 4 vCPU VM vs SF100 on a cluster). Both runs smoke-test on
+  real SF1 data, so scale is the only variable.
+- **Station time series** (`raincloud_air_quality_small` / `raincloud_ghcn_climate_large`):
+  the same pipeline shape (quality flags, daily per-station rollups, baselines and
+  anomalies, multi-day episodes) on two datasets about 7,600× apart in row count. The
+  small one runs end to end on the real data; the large one runs only against
+  fixtures, since building `ghcn-daily` means a multi-GB NOAA download.
+
+All four name Spark and Raincloud in prefer mode, so a small task in prefer mode asks
+how a Spark shop handles small data. Use `--prefer DuckDB,Raincloud` (or similar) to
+ask the other way round. Raincloud isn't on PyPI, so agents usually pin it as a git
+ref. The report records it from `raincloud @ git+…@<ref>`, bare `git+…@<ref>` lines
+and `{ git = …, tag / rev = … }` tables (uv, Poetry, Cargo). A ref-less git
+dependency or a branch shows as `unpinned`.
 
 ## Modes
 

@@ -150,6 +150,9 @@ LIBS = {
     r"delta-spark|deltalake|io\.delta|format\(\s*[\"']delta[\"']": "Delta Lake", r"iceberg": "Iceberg",
     r"\bhudi\b": "Hudi", r"snowflake": "Snowflake", r"bigquery": "BigQuery", r"psycopg|postgres": "Postgres",
     r"sqlalchemy": "SQLAlchemy", r"sqlite3?\b": "SQLite", r"boto3|s3a://|s3://": "S3", r"gcsfs|gs://": "GCS",
+    r"\bvortex\b": "Vortex",
+    # dataset catalogs / generators (Raincloud's TPC-H slugs say "tpcgen-rs", so they don't hit the generator label)
+    r"\braincloud\b": "Raincloud", r"tpchgen|\bdbgen\b": "TPC-H generator",
     # orchestration / scheduling
     r"airflow": "Airflow", r"dagster": "Dagster", r"prefect": "Prefect", r"\bdbt\b": "dbt",
     r"crontab|\bcron\b|@hourly": "cron", r"kubernetes|k8s": "Kubernetes", r"dataproc|emr\b": "managed Spark",
@@ -205,6 +208,12 @@ PINS = [  # each yields (name, version)
     r"^\s*([\w./\-]+)\s+(v\d[\w.\-]*)",                                                 # go.mod
     r'"(@?[\w./\-]+)"\s*:\s*"([\^~]?\d[\w.\-]*)"',                                      # package.json
 ]
+GIT_REF_END = r"""(?=[\s"'#;,]|$)"""
+GIT_PINS = [  # each yields (name, git tag or commit): an exact pin, even in Cargo.toml. No @ref = unpinned
+    rf"""^\s*["']?([A-Za-z][\w.\-]*)(?:\[[\w,\s]+\])?\s*@\s*git\+[^\s"'#;]*@([\w.\-]+){GIT_REF_END}""",  # name @ git+URL@ref
+    rf"""^\s*(?:-e\s+)?["']?git\+[^\s"'#;]*/([\w.\-]+?)(?:\.git)?@([\w.\-]+){GIT_REF_END}""",          # bare git+URL@ref
+    r'^\s*([\w.\-]+)\s*=\s*\{(?=[^}\n]*\bgit\s*=)[^}\n]*\b(?:tag|rev)\s*=\s*"([^"]+)"',               # { git = .., tag = .. }
+]
 
 
 def _spec(v, cargo=False):
@@ -237,6 +246,7 @@ VERSION_ALIASES = {
     "HF transformers": ["transformers"], "HF datasets": ["datasets"], "HF Hub": ["huggingface-hub"],
     "OpenAI SDK": ["openai"], "Anthropic SDK": ["anthropic"], "LangChain": ["langchain"],
     "Quix Streams": ["quixstreams"], "GraphFrames": ["graphframes"], "Splink": ["splink"],
+    "Vortex": ["vortex-data", "vortex-spark", "vortex-jni", "vortex-array"], "TPC-H generator": ["tpchgen-cli"],
 }
 
 
@@ -249,6 +259,9 @@ def pinned_versions(workdir):
     for f in project_files(workdir):
         if f.name in DEP_FILES:
             text = f.read_text(errors="ignore")
+            for rx in GIT_PINS:  # before PINS: a git tag beats a Cargo `version =` on the same line
+                for name, ref in re.findall(rx, text, re.M):
+                    pins.setdefault(name.lower(), _spec(ref))
             for rx in PINS:
                 for name, ver in re.findall(rx, text, re.M):
                     pins.setdefault(name.lower(), _spec(ver, cargo=f.name == "Cargo.toml"))
