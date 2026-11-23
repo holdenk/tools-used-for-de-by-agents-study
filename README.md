@@ -42,8 +42,9 @@ All four name Spark and Raincloud in prefer mode, so a small task in prefer mode
 how a Spark shop handles small data. Use `--prefer DuckDB,Raincloud` (or similar) to
 ask the other way round. Raincloud isn't on PyPI, so agents usually pin it as a git
 ref. The report records it from `raincloud @ git+…@<ref>`, bare `git+…@<ref>` lines
-and `{ git = …, tag / rev = … }` tables (uv, Poetry, Cargo). A ref-less git
-dependency or a branch shows as `unpinned`.
+and `{ git = …, tag / rev = … }` tables (uv, Poetry, Cargo). A ref counts as a pin
+only if it looks immutable: a version-like tag (`v0.3.2`) or a commit hash. A ref-less
+git dependency, a `branch =`, or any other ref (`@main`) shows as `unpinned`.
 
 ## Modes
 

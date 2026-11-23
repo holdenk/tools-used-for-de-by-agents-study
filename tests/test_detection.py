@@ -19,6 +19,8 @@ import agent_bakeoff as ab
      {"raincloud": "0.3.2"}),
     ("Cargo.toml", '[dependencies]\nvortex = { git = "https://github.com/spiraldb/vortex", tag = "0.86.1" }\nserde = "1.0"\n',
      {"vortex": "0.86.1", "serde": "^1.0"}),
+    ("pyproject.toml", '[tool.uv.sources]\nraincloud = { git = "https://github.com/spiraldb/raincloud", rev = "deadbeef12" }\n',
+     {"raincloud": "deadbeef12"}),                                         # a commit hash is a pin
     ("requirements.txt", "pyspark>=3.5.1, <4\n", {"pyspark": ">=3.5.1,<4"}),
     ("requirements.txt", "pyspark==3.5.*\n", {"pyspark": "==3.5.*"}),  # a wildcard is a range, not a pin
 ])
@@ -31,7 +33,10 @@ def test_pins(workdir: Path, filename: str, text: str, want: dict[str, str]) -> 
 @pytest.mark.parametrize("text", [
     "raincloud @ git+https://github.com/spiraldb/raincloud\n",          # no ref
     "raincloud @ git+ssh://git@github.com/spiraldb/raincloud.git\n",     # the @ is the ssh user, not a ref
+    "raincloud @ git+https://github.com/spiraldb/raincloud@main\n",     # a branch can move
+    "git+https://github.com/spiraldb/raincloud.git@release-next#egg=raincloud\n",
     '[tool.uv.sources]\nraincloud = { git = "https://github.com/spiraldb/raincloud", branch = "develop" }\n',
+    '[tool.uv.sources]\nraincloud = { git = "https://github.com/spiraldb/raincloud", rev = "develop" }\n',
 ])
 def test_git_dependency_without_a_fixed_ref_is_unpinned(workdir: Path, text: str) -> None:
     (workdir / ("pyproject.toml" if "uv" in text else "requirements.txt")).write_text(text)

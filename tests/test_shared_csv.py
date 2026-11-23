@@ -47,6 +47,15 @@ def test_identical_old_runs_in_two_out_dirs_stay_distinct(tmp_path: Path) -> Non
     assert ab.sync_shared(shared, [old], "bakeoff-2") == 0
 
 
+def test_old_runs_in_same_named_out_dirs_stay_distinct(tmp_path: Path) -> None:
+    """Two machines both using the default `bakeoff` dir, syncing old tallies into one shared CSV."""
+    base = {k: v for k, v in make_result().items() if k != "started"}
+    other = {**base, "api_ms": 98765, "cost_usd": 0.4321}  # same cell, repeat, wall time and status
+    shared = tmp_path / "observations.csv"
+    assert ab.sync_shared(shared, [base], "bakeoff") == 1
+    assert ab.sync_shared(shared, [other], "bakeoff") == 1
+
+
 @pytest.mark.parametrize("answer", [{"components": 42}, {"components": [{"name": "pyspark"}], "languages": 42},
                                     {"components": "pyspark", "languages": {"Python": "3.12"}}])
 def test_malformed_answers_are_recorded_not_fatal(tmp_path: Path, answer: dict[str, object]) -> None:

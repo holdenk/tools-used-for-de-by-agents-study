@@ -232,11 +232,19 @@ PINS = [  # each yields (name, version)
     r'"(@?[\w./\-]+)"\s*:\s*"([\^~]?\d[\w.\-]*)"',                                      # package.json
 ]
 GIT_REF_END = r"""(?=[\s"'#;,]|$)"""
-GIT_PINS = [  # each yields (name, git tag or commit): an exact pin, even in Cargo.toml. No @ref = unpinned
+GIT_PINS = [  # each yields (name, git ref). No ref, or a ref that may move (see git_ref_pin), is unpinned
     rf"""^\s*["']?([A-Za-z][\w.\-]*)(?:\[[\w,\s]+\])?\s*@\s*git\+[^\s"'#;]*@([\w.\-]+){GIT_REF_END}""",  # name @ git+URL@ref
     rf"""^\s*(?:-e\s+)?["']?git\+[^\s"'#;]*/([\w.\-]+?)(?:\.git)?@([\w.\-]+){GIT_REF_END}""",          # bare git+URL@ref
     r'^\s*([\w.\-]+)\s*=\s*\{(?=[^}\n]*\bgit\s*=)[^}\n]*\b(?:tag|rev)\s*=\s*"([^"]+)"',               # { git = .., tag = .. }
 ]
+
+
+def git_ref_pin(ref: str) -> str | None:
+    """A git ref counts as a pin only if it looks immutable: a version-like tag ('v0.3.2', '0.86.1') or a commit
+    hash. Syntax can't tell a branch from a tag, so anything else ('main', 'develop', 'release-x') is unpinned."""
+    if re.fullmatch(r"v?\d[\w.\-+]*", ref) or re.fullmatch(r"[0-9a-fA-F]{7,40}", ref):
+        return _spec(ref)  # an exact pin, even in Cargo.toml
+    return None
 
 
 def _spec(v: str, cargo: bool = False) -> str:
@@ -284,7 +292,8 @@ def pinned_versions(workdir: Path) -> dict[str, str]:
             text = f.read_text(errors="ignore")
             for rx in GIT_PINS:  # before PINS: a git tag beats a Cargo `version =` on the same line
                 for name, ref in re.findall(rx, text, re.M):
-                    pins.setdefault(name.lower(), _spec(ref))
+                    if pin := git_ref_pin(ref):
+                        pins.setdefault(name.lower(), pin)
             for rx in PINS:
                 for name, ver in re.findall(rx, text, re.M):
                     pins.setdefault(name.lower(), _spec(ver, cargo=f.name == "Cargo.toml"))
@@ -813,10 +822,12 @@ SHARED_FIELDS = ["run_id", "out", "started", "task", "variant", "style", "mode",
 
 
 def run_id(r: Result, out: str) -> str:
-    """Stable for a finished run (tally rows sync to the same id), and distinct across repeats and --out dirs
-    (by name): runs from before `started` existed can otherwise match on every other field."""
+    """Stable for a finished run (a tally row syncs to the same id, even after its --out dir moves), and distinct
+    between runs. Besides the cell and repeat, it hashes what each run measured (start time, durations, cost, files,
+    token usage), so runs from before `started` existed stay distinct even in two --out dirs with the same name."""
     key = [out, r["task"], r["variant"], r.get("style"), r["model"], r.get("rep") or 1, r.get("started") or "",
-           r.get("wall_s"), r.get("status")]
+           r.get("wall_s"), r.get("status"), r.get("api_ms"), r.get("cost_usd"), r.get("files"),
+           json.dumps(r.get("usage") or {}, sort_keys=True)]
     return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
 
 
