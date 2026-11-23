@@ -260,6 +260,18 @@ that adds a rate limiter doesn't trigger a pause. The quota-stopped run's stream
 in `<model>.stream.jsonl` until the retry overwrites it. Runs recorded before this
 check existed stay in the tally as failures.
 
+### Blocked access
+
+A run whose access is blocked isn't recorded either: an AI gateway or org policy that
+blocks the model or key ("Your access to this AI Gateway is blocked by your
+organization's policy", "not allowed by …", a 403), or a failed login (Claude Code's
+`authentication_failed`, "Not logged in", an invalid API key, a 401). Waiting won't fix
+those, so there's no pause: the bakeoff logs `ACCESS BLOCKED` and goes on to the next
+run. At the end it lists the blocked runs per model and exits with code 77. Fix
+access, then rerun with the same `--out` to pick them up. A block that gives quota as
+its reason ("blocked as you have exceeded the usage …") counts as out of quota, and
+gets the pause and retries.
+
 Compare two runs (e.g. to see how stable a model's choices are):
 
 ```bash

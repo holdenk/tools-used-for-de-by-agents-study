@@ -20,7 +20,9 @@ restores from, so no (task, variant, model, repeat) runs twice.
 
 A run that stops because the agent CLI is out of quota is logged but never recorded,
 so a rerun redoes it. The bakeoff pauses (--quota-wait, 24h) and retries that run, up to
---quota-retries (10) times, then stops with exit code 75.
+--quota-retries (10) times, then stops with exit code 75. A run whose access is blocked
+(a gateway or org policy, or a failed login) isn't recorded either; the bakeoff goes on
+without pausing and exits with code 77.
 
 A task is just a prompt file: prompts/<task>.md, with a `{tooling}` line the mode
 fills in and an optional `prefer: Tool, Tool` front-matter header.
@@ -563,28 +565,49 @@ def summarize(stream: str, workdir: Path, style: str = "build") -> Result:
     }
 
 
-# --- out of quota: the agent CLI stopped because its account hit a limit, not because of anything in the task
+# --- runs that never really ran: the agent CLI stopped because of its account, not because of anything in the task.
+# Neither kind is recorded, so a rerun redoes them. Out of quota: pause and retry. Access blocked: skip and go on.
 QUOTA_RX = re.compile(
     r"usage limit|rate[ _-]?limit|quota|too many requests|\b(?:error|status|code)\W{0,3}429\b|hit your [\w ]{0,30}limit"
     r"|\b(?:session|weekly|daily|monthly|spend(?:ing)?|plan|opus|sonnet) limit\b"
     r"|out of (?:extra usage|usage|credits?)|credit balance|insufficient (?:credits?|balance|funds)"
     r"|exceeded (?:the |your |its )?(?:\w+ ){0,2}(?:usage|quota|budget|spend|limit)", re.I)  # also AI gateways' caps
 QUOTA_WARNING_RX = re.compile(r"approaching|you've used \d|close to|now using extra usage", re.I)  # still running
-QUOTA_ERRORS = {"rate_limit", "billing_error"}  # Claude Code's `error` on the assistant message a run ends with
+# a policy block (an AI gateway, an org admin) or failed auth: waiting won't fix it. Checked after QUOTA_RX, so a
+# block that says why ("blocked as you have exceeded the usage ...") counts as quota.
+BLOCKED_RX = re.compile(
+    r"\baccess (?:to [^.]{0,60}?)?(?:is |was |has been )?(?:blocked|denied|revoked|forbidden)|\bblocked by\b"
+    r"|\b(?:not allowed|not permitted|disallowed|forbidden|denied) by\b|\b(?:error|status|code)\W{0,3}40[13]\b"
+    r"|\b40[13] (?:forbidden|unauthori[sz]ed)|not logged in|invalid (?:api key|x-api-key|token|credentials)"
+    r"|authentication (?:failed|error)|oauth token (?:has been )?(?:revoked|expired)", re.I)
 QUOTA_EXIT = 75  # EX_TEMPFAIL from sysexits.h: try again later
+BLOCKED_EXIT = 77  # EX_NOPERM from sysexits.h: permission denied
 
 
-class QuotaExhausted(Exception):
-    """The agent CLI stopped because its account is out of quota (usage limit, rate limit, no credits)."""
+class RunNotRecorded(Exception):
+    """The agent CLI stopped because of its account, so the run says nothing about the agent."""
 
 
-def quota_error(stream: str, stderr: str, returncode: int | None) -> str | None:
-    """Why a run stopped on quota, or None. Only a run that failed counts (non-zero exit or timeout, no result, or
-    an error result), and only what the CLI itself said: stderr, non-JSON stdout, an error result or error event,
-    or Claude Code's rate_limit / billing_error message. Never the agent's own messages, which can talk about
-    rate limits as part of the task."""
+class QuotaExhausted(RunNotRecorded):
+    """Out of quota: a usage limit, rate limit, spending cap or no credits. Comes back with time."""
+
+
+class AccessBlocked(RunNotRecorded):
+    """Blocked by a policy (an AI gateway, an org admin) or failed auth. Doesn't come back by waiting."""
+
+
+# Claude Code's `error` on the assistant message a run ends with
+CLAUDE_ERRORS: dict[str, type[RunNotRecorded]] = {
+    "rate_limit": QuotaExhausted, "billing_error": QuotaExhausted, "authentication_failed": AccessBlocked}
+
+
+def cli_error(stream: str, stderr: str, returncode: int | None) -> tuple[type[RunNotRecorded], str] | None:
+    """(QuotaExhausted or AccessBlocked, why) when a run stopped because of its account, else None. Only a run that
+    failed counts (non-zero exit or timeout, no result, or an error result), and only what the CLI itself said:
+    stderr, non-JSON stdout, an error result or error event, or Claude Code's error on its last message. Never the
+    agent's own messages, which can talk about rate limits or access control as part of the task."""
     texts: list[str] = []
-    flagged: str | None = None
+    flagged: tuple[type[RunNotRecorded], str] | None = None
     result: dict[str, Any] | None = None
     for line in stream.splitlines():
         try:
@@ -601,8 +624,8 @@ def quota_error(stream: str, stderr: str, returncode: int | None) -> str | None:
         elif ev.get("type") == "assistant" and ev.get("error"):
             content = (ev.get("message") or {}).get("content") or []
             text = " ".join(str(c.get("text") or "") for c in content if isinstance(c, dict)).strip()
-            if ev["error"] in QUOTA_ERRORS:
-                flagged = flagged or text or str(ev["error"])
+            if kind := CLAUDE_ERRORS.get(str(ev["error"])):
+                flagged = flagged or (kind, text or str(ev["error"]))
             texts.append(text)
     if returncode == 0 and result is not None and not result.get("is_error"):
         return None  # a finished run, whatever it said along the way
@@ -610,9 +633,13 @@ def quota_error(stream: str, stderr: str, returncode: int | None) -> str | None:
         return flagged
     if result is not None and result.get("is_error"):
         texts += [str(result.get("result") or ""), json.dumps(result.get("errors") or "")]
-    for line in "\n".join([*texts, stderr]).splitlines():
+    lines = "\n".join([*texts, stderr]).splitlines()
+    for line in lines:
         if QUOTA_RX.search(line) and not QUOTA_WARNING_RX.search(line):
-            return line.strip()[:300]
+            return QuotaExhausted, line.strip()[:300]
+    for line in lines:
+        if BLOCKED_RX.search(line):
+            return AccessBlocked, line.strip()[:300]
     return None
 
 
@@ -669,8 +696,9 @@ def run_one(run: Run, model: str, root: Path, timeout: int, rep: int = 1) -> Res
     stream_file = wd.parent / f"{wd.name}.stream.jsonl"
     stream_file.write_text(stream)
     (wd.parent / f"{wd.name}.prompt.txt").write_text(prompt)
-    if reason := quota_error(stream, err, code):
-        raise QuotaExhausted(f"{reason} (stream in {stream_file})")
+    if failure := cli_error(stream, err, code):
+        kind, reason = failure
+        raise kind(f"{reason} (stream in {stream_file})")
     summary = summarize(stream, wd, run["style"])
     if summary["invalid_answer"]:
         status += ", invalid answer"
@@ -1169,14 +1197,22 @@ def main() -> int:
             print(f"added {added} earlier run(s) from {tally} to {shared}", flush=True)
     out_of_quota: str | None = None  # the model we gave up on, and how many runs that left undone
     left = 0
+    blocked: Counter[str] = Counter()  # model -> runs skipped because its access was blocked
     for i, (run, m, rep) in enumerate(todo, 1):
         key = (run["task"], run["variant"], m, rep)
         label = f"{run['task']} / {run['variant']} / {m}" + (f" #{rep}" if rep > 1 else "")
         if key in done:
             print(f"[{i}/{len(todo)}] {label} already in {tally}, skipping", flush=True)
             continue
-        maybe = run_with_quota_retries(functools.partial(run_one, run, m, root, a.timeout, rep),
-                                       f"[{i}/{len(todo)}] {label}", a.quota_retries, a.quota_wait)
+        try:
+            maybe = run_with_quota_retries(functools.partial(run_one, run, m, root, a.timeout, rep),
+                                           f"[{i}/{len(todo)}] {label}", a.quota_retries, a.quota_wait)
+        except AccessBlocked as e:  # waiting won't fix it, so don't: skip this run and go on
+            blocked[m] += 1
+            print(f"    {clock()}: ACCESS BLOCKED: {e}", flush=True)
+            print("    not recorded, so a rerun with the same --out will redo this run once access is fixed; "
+                  "going on without pausing", flush=True)
+            continue
         if maybe is None:
             out_of_quota = m
             left = sum((t["task"], t["variant"], tm, trep) not in done for t, tm, trep in todo[i - 1:])
@@ -1198,13 +1234,18 @@ def main() -> int:
     if results:  # also repairs exports when a resumed run had nothing left to do
         (root / "results.json").write_text(json.dumps(results, indent=1))
         (root / "report.md").write_text(report(results))
+    if blocked:
+        print(f"\nACCESS BLOCKED for {sum(blocked.values())} run(s), none of them recorded: "
+              + ", ".join(f"{m} ×{n}" for m, n in blocked.most_common())
+              + ". Fix access (an AI gateway or org policy, or the CLI's login), then rerun with the same --out to "
+                "pick them up.", flush=True)
     if out_of_quota:
         print(f"\nSTOPPED, out of quota: {left} run(s) not done, none of them recorded. Rerun with the same --out "
               f"to pick them up, or leave {out_of_quota} out with --models or --match. {root}/report.md has the "
               f"{len(results)} run(s) so far.", flush=True)
         return QUOTA_EXIT
-    print(f"\nDONE. {root}/report.md")
-    return 0
+    print(f"\nDONE{', apart from the blocked runs' if blocked else ''}. {root}/report.md")
+    return BLOCKED_EXIT if blocked else 0
 
 
 if __name__ == "__main__":

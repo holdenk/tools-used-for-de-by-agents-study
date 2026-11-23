@@ -1,4 +1,5 @@
-"""Out-of-quota runs: detected only from the CLI's own errors, never recorded, paused on and retried."""
+"""Runs stopped by the account, not the task: detected only from the CLI's own errors and never recorded.
+Out of quota: paused on and retried. Access blocked: skipped without pausing."""
 import csv
 import json
 import os
@@ -15,6 +16,7 @@ REPO = Path(__file__).resolve().parent.parent
 LIMIT = "You've hit your session limit · resets 3pm (America/Los_Angeles)"
 GATEWAY = ('API Error: 403 {"error":{"message":"Your access to this AI Gateway is blocked as you have exceeded '
            'the usage limit for this key."}}')
+POLICY = 'API Error: 403 Your access to this AI Gateway is blocked by your organization\'s policy.'
 
 
 def events(*evs: dict[str, Any]) -> str:
@@ -39,20 +41,34 @@ def result(text: str, is_error: bool) -> dict[str, Any]:
     ("", "Error: You've hit your usage limit for this month.\n", 1, "hit your usage limit"),  # stderr, no events
     ("API Error: 429 Too Many Requests\n", "", 1, "429"),  # non-JSON stdout
     (events({"type": "error", "message": "Monthly quota exceeded"}), "", 1, "quota"),
-    # an AI gateway in front of the API, as Claude Code surfaces it and as plain stderr
+    # an AI gateway in front of the API, as Claude Code surfaces it and as plain stderr: blocked, but for quota
     (events(said(GATEWAY, "unknown"), result(GATEWAY, True)), "", 1, "exceeded the usage"),
     ("", "Your access to this AI Gateway is blocked as you have exceeded the usage.....\n", 1, "AI Gateway"),
     ("", "Error: you have exceeded your monthly budget for this key\n", 1, "monthly budget"),
 ])
-def test_quota_error_found(stream: str, stderr: str, code: int, want: str) -> None:
-    reason = ab.quota_error(stream, stderr, code)
-    assert reason is not None and want in reason
+def test_quota_found(stream: str, stderr: str, code: int, want: str) -> None:
+    failure = ab.cli_error(stream, stderr, code)
+    assert failure is not None and failure[0] is ab.QuotaExhausted and want in failure[1]
+
+
+@pytest.mark.parametrize(("stream", "stderr", "code", "want"), [
+    (events(said(POLICY, "unknown"), result(POLICY, True)), "", 1, "blocked by your organization"),
+    ("", "Your access to this AI Gateway is blocked by your organization's policy\n", 1, "AI Gateway"),
+    ("", "Error: model claude-opus is not allowed by your organization's gateway policy\n", 1, "not allowed by"),
+    (events(said("Invalid API key · Fix external API key", "authentication_failed"),
+            result("Invalid API key · Fix external API key", True)), "", 1, "Invalid API key"),
+    (events(result("Not logged in · Please run /login", True)), "", 1, "Not logged in"),
+    ("", "Error: request failed with status 403\n", 1, "403"),
+])
+def test_access_blocked_found(stream: str, stderr: str, code: int, want: str) -> None:
+    failure = ab.cli_error(stream, stderr, code)
+    assert failure is not None and failure[0] is ab.AccessBlocked and want in failure[1]
 
 
 @pytest.mark.parametrize(("stream", "stderr", "code"), [
-    # a finished run can talk about rate limits and quotas: it's the task, not the account
+    # a finished run can talk about rate limits, quotas and access control: it's the task, not the account
     (events(said("Kafka quotas and a rate limiter, per the usage limit spec"),
-            result("Added a rate limit: 429 Too Many Requests goes to the DLQ", False)), "", 0),
+            result("Added a rate limit: 429 Too Many Requests goes to the DLQ; access is denied by IAM", False)), "", 0),
     (events(said("I'll add a rate limiter for the card API")), "", None),  # timed out; the agent's own words
     (events(said("ok"))[:-1] + '\n{"type": "assistant", "message": {"content": [{"text": "a quota per', "", None),
     (events(result("Prompt is too long", True)), "", 1),
@@ -60,10 +76,9 @@ def test_quota_error_found(stream: str, stderr: str, code: int, want: str) -> No
             result("API Error: 500 Internal server error", True)), "", 1),
     ("", "Approaching usage limit · resets 3pm\nTraceback: ConnectionResetError\n", 1),  # a warning, then a crash
     ("", "You've used 90% of your weekly limit\n", 1),
-    ("", "Your access to this AI Gateway is blocked by your organization's policy\n", 1),  # not a quota
 ])
-def test_quota_error_not_found(stream: str, stderr: str, code: int | None) -> None:
-    assert ab.quota_error(stream, stderr, code) is None
+def test_no_cli_error(stream: str, stderr: str, code: int | None) -> None:
+    assert ab.cli_error(stream, stderr, code) is None
 
 
 def flaky(outcomes: list[str]) -> Any:
@@ -109,9 +124,11 @@ n = int(open(counter).read()) if os.path.exists(counter) else 0
 open(counter, "w").write(str(n + 1))
 plan = os.environ["FAKE_PLAN"].split(",")
 init = {"type": "system", "subtype": "init", "model": "claude-fake"}
-if plan[min(n, len(plan) - 1)] == "quota":
-    msg = "You've hit your session limit, resets 3pm"
-    for ev in [init, {"type": "assistant", "message": {"content": [{"type": "text", "text": msg}]}, "error": "rate_limit"},
+outcome = plan[min(n, len(plan) - 1)]
+if outcome in ("quota", "blocked"):
+    msg, error = (("You've hit your session limit, resets 3pm", "rate_limit") if outcome == "quota" else
+                  ("API Error: 403 Your access to this AI Gateway is blocked by your organization's policy", "unknown"))
+    for ev in [init, {"type": "assistant", "message": {"content": [{"type": "text", "text": msg}]}, "error": error},
                {"type": "result", "subtype": "success", "is_error": True, "result": msg}]:
         print(json.dumps(ev))
     sys.exit(1)
@@ -181,6 +198,23 @@ def test_gives_up_and_a_rerun_catches_up(tmp_path: Path, fake_bin: Path) -> None
     assert calls(tmp_path) == 1 and p.stdout.count("skipping") == 1
     assert sorted(row["variant"] for row in recorded(tmp_path)) == ["ask-float", "ask-prefer-spark+raincloud"]
     assert len(shared_runs(tmp_path)) == 2
+
+
+def test_blocked_runs_are_skipped_without_pausing(tmp_path: Path, fake_bin: Path) -> None:
+    # --quota-wait 1000 hours: a pause would hang the test, so this also shows a block never pauses
+    p = bakeoff(tmp_path, fake_bin, "blocked,ok", "--quota-wait", "1000")
+    assert p.returncode == ab.BLOCKED_EXIT, p.stderr
+    assert calls(tmp_path) == 2 and "h, until " not in p.stdout and "OUT OF QUOTA" not in p.stdout
+    assert p.stdout.count("ACCESS BLOCKED: ") == 1 and "ACCESS BLOCKED for 1 run(s), none of them recorded: claude ×1" in p.stdout
+    assert "DONE, apart from the blocked runs" in p.stdout
+    [row] = recorded(tmp_path)  # the float run was blocked; the prefer run went through
+    assert row["variant"] == "ask-prefer-spark+raincloud"
+    assert len(shared_runs(tmp_path)) == 1
+
+    p = bakeoff(tmp_path, fake_bin, "ok")
+    assert p.returncode == 0, p.stderr
+    assert calls(tmp_path) == 1 and p.stdout.count("skipping") == 1
+    assert len(recorded(tmp_path)) == 2
 
 
 def test_quota_error_then_a_hang_until_the_timeout(tmp_path: Path, fake_bin: Path,
