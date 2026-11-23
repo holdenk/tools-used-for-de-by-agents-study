@@ -437,7 +437,7 @@ def answer_languages(entries: Iterable[object] | None) -> tuple[dict[str, int | 
     langs: dict[str, int | None] = {}  # same shape as build style's {language: LOC}; an answer has no LOC
     versions: dict[str, str] = {}
     texts: list[str] = []
-    for entry in entries or []:
+    for entry in entries if isinstance(entries, list) else []:  # a model can put anything here
         if isinstance(entry, dict):
             name, ver = str(entry.get("name") or ""), answer_version(entry.get("version"))
             texts.append(" ".join(str(v) for v in entry.values()))
@@ -812,9 +812,10 @@ SHARED_FIELDS = ["run_id", "out", "started", "task", "variant", "style", "mode",
                  "invalid_answer", "kind", "name", "version", "value"]
 
 
-def run_id(r: Result) -> str:
-    """Stable for a finished run (tally rows sync to the same id), unique across --out dirs and repeats."""
-    key = [r["task"], r["variant"], r.get("style"), r["model"], r.get("rep") or 1, r.get("started") or "",
+def run_id(r: Result, out: str) -> str:
+    """Stable for a finished run (tally rows sync to the same id), and distinct across repeats and --out dirs
+    (by name): runs from before `started` existed can otherwise match on every other field."""
+    key = [out, r["task"], r["variant"], r.get("style"), r["model"], r.get("rep") or 1, r.get("started") or "",
            r.get("wall_s"), r.get("status")]
     return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
 
@@ -828,7 +829,7 @@ def one_line(v: object, cap: int | None = None) -> str:
 def observations(r: Result, out: str) -> list[dict[str, Any]]:
     """One row per fact about a run: kind = run | usage | language | library | preferred | pin | agent_tool |
     shell_command | answer_component | answer_language | rationale | prompt."""
-    base = {"run_id": run_id(r), "out": out, "started": r.get("started") or "", "task": r["task"],
+    base = {"run_id": run_id(r, out), "out": out, "started": r.get("started") or "", "task": r["task"],
             "variant": r["variant"], "style": r.get("style") or "", "mode": r.get("mode") or "",
             "preferred": "+".join(r.get("preferred") or []), "model": r["model"],
             "served_model": r.get("served_model") or "", "rep": r.get("rep") or 1,
@@ -861,10 +862,11 @@ def observations(r: Result, out: str) -> list[dict[str, Any]]:
         add("shell_command", i, value=c)
     ans = r.get("answer")
     if isinstance(ans, dict):  # ask style: the raw answer, before any normalization
-        for c in ans.get("components") or []:
+        comps, langs = ans.get("components"), ans.get("languages")
+        for c in comps if isinstance(comps, list) else []:
             if isinstance(c, dict):
                 add("answer_component", c.get("name"), c.get("version"), c.get("role"))
-        for entry in ans.get("languages") or []:
+        for entry in langs if isinstance(langs, list) else []:
             name, ver = (entry.get("name"), entry.get("version")) if isinstance(entry, dict) else (entry, "")
             add("answer_language", name, ver)
         if ans.get("rationale"):
@@ -899,7 +901,7 @@ def append_shared(path: Path, rows: Sequence[dict[str, Any]]) -> None:
 def sync_shared(path: Path, results: Sequence[Result], out: str) -> int:
     """Add any run in this tally that the shared CSV doesn't have yet (older runs, or a new shared file)."""
     have = shared_ids(path)
-    missing = [r for r in results if run_id(r) not in have]
+    missing = [r for r in results if run_id(r, out) not in have]
     append_shared(path, [row for r in missing for row in observations(r, out)])
     return len(missing)
 
@@ -1028,9 +1030,12 @@ def main() -> int:
         print(f"    {r['status']} {r['wall_s']}s langs={list(r['languages'])} libs={r['libraries']}"
               + (f" preferred: {preferred_cell(r)}" if r["preferred"] else ""), flush=True)
         results.append(r)
-        if shared:
-            append_shared(shared, observations(r, root.name))
         write_tally(tally, results)
+        if shared:
+            try:
+                append_shared(shared, observations(r, root.name))
+            except (OSError, ValueError, TypeError) as e:  # the next invocation's sync_shared backfills it
+                print(f"    warning: couldn't add this run to {shared}: {e}", file=sys.stderr, flush=True)
         done.add(key)
         (root / "results.json").write_text(json.dumps(results, indent=1))
         (root / "report.md").write_text(report(results))

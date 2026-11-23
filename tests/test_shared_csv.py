@@ -35,8 +35,25 @@ def test_old_tally_rows_load_as_repeat_1(tmp_path: Path) -> None:
 
 def test_run_id_is_stable_and_distinct() -> None:
     a, b = make_result(rep=1), make_result(rep=2)
-    assert ab.run_id(a) == ab.run_id(json.loads(json.dumps(a)))
-    assert ab.run_id(a) != ab.run_id(b)
+    assert ab.run_id(a, "out") == ab.run_id(json.loads(json.dumps(a)), "out")
+    assert ab.run_id(a, "out") != ab.run_id(b, "out")
+
+
+def test_identical_old_runs_in_two_out_dirs_stay_distinct(tmp_path: Path) -> None:
+    old = {k: v for k, v in make_result().items() if k != "started"}  # tallies from before `started` existed
+    shared = tmp_path / "observations.csv"
+    assert ab.sync_shared(shared, [old], "bakeoff-1") == 1
+    assert ab.sync_shared(shared, [old], "bakeoff-2") == 1
+    assert ab.sync_shared(shared, [old], "bakeoff-2") == 0
+
+
+@pytest.mark.parametrize("answer", [{"components": 42}, {"components": [{"name": "pyspark"}], "languages": 42},
+                                    {"components": "pyspark", "languages": {"Python": "3.12"}}])
+def test_malformed_answers_are_recorded_not_fatal(tmp_path: Path, answer: dict[str, object]) -> None:
+    stream = json.dumps({"type": "result", "is_error": False, "result": json.dumps(answer)})
+    summary = ab.summarize(stream, tmp_path, "ask")
+    rows = ab.observations({**make_result(style="ask"), **summary}, "out")
+    assert rows and {row["kind"] for row in rows} >= {"run", "prompt"}
 
 
 def test_observations(tmp_path: Path) -> None:
