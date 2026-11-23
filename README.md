@@ -78,10 +78,10 @@ usually the client's (e.g. `confluent-kafka 2.6.1` shows up as `Kafka 2.6.1`).
 
 ## Repeats and convergence
 
-One run per model shows what a model picked once, not what it usually picks.
-`--repeats N` runs every (task, variant, model) N times. Repeat 1 runs everywhere
-first, so a run cut short still covers every cell. The report then adds a
-**Convergence** table per (task, variant):
+One run per model shows what a model picked once, not what it usually picks, so
+every (task, variant, model) runs 3 times by default (`--repeats N` to change it;
+`--repeats 1` for a single pass). Repeat 1 runs everywhere first, so a run cut short
+still covers every cell. The report adds a **Convergence** table per (task, variant):
 
 - **top stack**: the most common exact library set, and its share of runs;
 - **effective stacks**: 2^entropy of the library-set distribution (1 means every
@@ -111,6 +111,64 @@ used small models to afford more samples. Each run also records when it started
 (`started`) and the model the CLI reported (`served_model`, e.g. what plain
 `claude` resolved to), so a pin can later be compared against releases on that day
 and against the model's training cutoff.
+
+## Prompt versions
+
+Prompts get edited, and runs from before and after an edit shouldn't be pooled by
+accident. Every run records:
+
+- `prompt_sha`: the first 12 hex digits of the SHA-256 of the exact text the agent
+  got (task file + mode line + ask trailer). Each (task, variant) has its own.
+- `template_sha`: the same hash of the task's prompt file alone, front matter
+  included. It changes only when the task itself is edited, across all its variants.
+- `harness_commit`: the git commit of `agent_bakeoff.py` and `prompts/`, with
+  `-dirty` when either had uncommitted changes.
+
+The exact prompt is also saved as `<model>.prompt.txt` next to the run's stream, and
+in the shared CSV below. Runs from before this existed have empty hashes.
+
+## Shared observations CSV
+
+Every finished run is also appended to one long-format CSV shared by all `--out`
+directories, for analytics across many bakeoffs: `data/observations.csv` by
+default, or `$BAKEOFF_SHARED_CSV` or `--shared-csv PATH` (`--shared-csv ''` turns it
+off). Each run also syncs its `--out` tally into it, so runs from before the shared
+CSV existed get added, once. Appends take a file lock, so parallel bakeoffs can
+share one file.
+
+One row per fact about a run. Every row repeats the run's identity, so you can
+filter and group without joins: `run_id, out, started, task, variant, style, mode,
+preferred, model, served_model, rep, prompt_sha, template_sha, harness_commit,
+status, ok, invalid_answer`. Then `kind, name, version, value` describe the fact:
+
+| kind | name | version | value |
+|---|---|---|---|
+| `run` | `wall_s`, `api_ms`, `cost_usd`, `files`, `spark_version` | | the number |
+| `usage` | token counter, e.g. `output_tokens` | | the count |
+| `language` | e.g. `Python` | version, if the run gave one | LOC (build style) |
+| `library` | `LIBS` label, e.g. `Spark` | version we found | `1` |
+| `preferred` | tool named in prefer mode | version we found | `1` used / `0` not |
+| `pin` | package as written, e.g. `pyspark` | the pinned spec | |
+| `agent_tool` | agent tool, e.g. `bash` | | call count |
+| `shell_command` | order index | | the command |
+| `answer_component` | ask style: raw component name | raw version | role |
+| `answer_language` | ask style: raw language name | raw version | |
+| `rationale` | | | ask style: the agent's reasoning |
+| `prompt` | `prompt_sha` | | the full prompt text |
+
+Values never contain raw newlines: a newline is written as `\n` and a backslash as
+`\\`, so every row is one physical line. Long text is capped at 2,000 characters,
+except the prompt. For example, in PySpark:
+
+```python
+from pyspark.sql import functions as F
+obs = spark.read.csv("data/observations.csv", header=True)
+(obs.where("kind = 'library' AND mode = 'float' AND ok = 1")
+    .groupBy("task", "name")
+    .agg(F.countDistinct("run_id").alias("runs"))
+    .orderBy("task", F.desc("runs"))
+    .show())
+```
 
 ## Adding a task
 
@@ -163,8 +221,9 @@ python3 agent_bakeoff.py --out bakeoff-ask --style ask --mode float --repeats 20
   task's `prefer:` header and gets its own variant (`prefer-flink+kafka`), so it
   doesn't collide with default-preference runs.
 - Output goes to `<out>/<task>/<variant>/<model>/` (the agent's workspace) and
-  `<out>/<task>/<variant>/<model>.stream.jsonl` (its raw stream). The variant is
-  `float` or `prefer-<tools>`. Repeats after the first go to `<model>.rep<N>/`.
+  `<out>/<task>/<variant>/<model>.stream.jsonl` (its raw stream), with the exact
+  prompt in `<model>.prompt.txt`. The variant is `float` or `prefer-<tools>`.
+  Repeats after the first go to `<model>.rep<N>/`.
 - `<out>/report.md` has the prefer-mode version tables, the float-mode tool tables,
   the convergence table, then per-(task, variant) details. With repeats, a pivot
   cell lists each distinct answer with its count (`Spark 3.5.1 ×3; Spark 4.0.1 ×1`).

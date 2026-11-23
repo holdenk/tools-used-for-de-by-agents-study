@@ -24,13 +24,20 @@ fills in and an optional `prefer: Tool, Tool` front-matter header.
 import argparse
 import collections
 import csv
+import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+
+try:
+    import fcntl  # lock the shared CSV while appending; not on Windows
+except ImportError:
+    fcntl = None
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
@@ -76,7 +83,8 @@ def parse_prompt(text):
 
 
 def load_tasks(spec, prompts_dir):
-    """task name -> (prefer, body). spec: comma list of task names or prompt file paths; default every prompts/*.md."""
+    """task name -> (prefer, body, template sha). spec: comma list of task names or prompt file paths; default every
+    prompts/*.md. The sha (of the whole file, front matter included) says which version of the task prompt ran."""
     if spec:
         files = [Path(s) if s.endswith((".md", ".txt")) else prompts_dir / f"{s}.md" for s in spec.split(",")]
     else:
@@ -84,7 +92,11 @@ def load_tasks(spec, prompts_dir):
     missing = [str(f) for f in files if not f.is_file()]
     if missing:
         sys.exit(f"no such prompt file(s): {', '.join(missing)}")
-    return {f.stem: parse_prompt(f.read_text()) for f in files}
+    return {f.stem: (*parse_prompt(f.read_text()), sha(f.read_text())) for f in files}
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
 def join_tools(tools):
@@ -541,12 +553,14 @@ def run_one(run, model, root, timeout, rep=1):
         stream = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         err, status = "", "TIMEOUT"
     (wd.parent / f"{wd.name}.stream.jsonl").write_text(stream)
+    (wd.parent / f"{wd.name}.prompt.txt").write_text(prompt)
     summary = summarize(stream, wd, run["style"])
     if summary["invalid_answer"]:
         status += ", invalid answer"
     return {"task": run["task"], "variant": run["variant"], "style": run["style"], "mode": run["mode"],
             "preferred": run["preferred"], "model": model, "rep": rep, "started": started, "status": status,
-            "wall_s": round(time.time() - t0),
+            "wall_s": round(time.time() - t0), "prompt_sha": run["prompt_sha"], "template_sha": run["template_sha"],
+            "prompt": prompt,
             **summary, "stderr": err[-400:]}
 
 
@@ -716,7 +730,9 @@ def report(results):
                          f"| {', '.join(r['libraries']) or '-'} | {preferred_cell(r)} | {tv} |")
         for r in rs:
             lines += ["", f"### {g[0]} / {g[1]} / {run_label(r)}",
-                      f"started: {r.get('started') or '?'}, served model: {r.get('served_model') or '?'}",
+                      f"started: {r.get('started') or '?'}, served model: {r.get('served_model') or '?'}, "
+                      f"prompt {r.get('prompt_sha') or '?'} (task file {r.get('template_sha') or '?'}), "
+                      f"harness {r.get('harness_commit') or '?'}",
                       f"languages: {r['languages']}",
                       f"language versions: {r.get('language_versions') or {}}",
                       f"libraries: {r['libraries']}", f"tool versions: {r['tool_versions']}",
@@ -765,6 +781,118 @@ def write_tally(path, results):
     tmp.replace(path)
 
 
+# --- shared observations CSV: every run from every --out, in one long-format file for later analytics
+SHARED_CSV = os.environ.get("BAKEOFF_SHARED_CSV") or str(Path(__file__).resolve().parent / "data" / "observations.csv")
+SHARED_FIELDS = ["run_id", "out", "started", "task", "variant", "style", "mode", "preferred", "model",
+                 "served_model", "rep", "prompt_sha", "template_sha", "harness_commit", "status", "ok",
+                 "invalid_answer", "kind", "name", "version", "value"]
+
+
+def run_id(r):
+    """Stable for a finished run (tally rows sync to the same id), unique across --out dirs and repeats."""
+    key = [r["task"], r["variant"], r.get("style"), r["model"], r.get("rep") or 1, r.get("started") or "",
+           r.get("wall_s"), r.get("status")]
+    return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
+
+
+def one_line(v, cap=None):
+    """CSV-safe scalar: no raw newlines, so every observation is one physical line for any CSV reader."""
+    text = "" if v is None else str(v).replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
+    return text[:cap] if cap else text
+
+
+def observations(r, out):
+    """One row per fact about a run: kind = run | usage | language | library | preferred | pin | agent_tool |
+    shell_command | answer_component | answer_language | rationale | prompt."""
+    base = {"run_id": run_id(r), "out": out, "started": r.get("started") or "", "task": r["task"],
+            "variant": r["variant"], "style": r.get("style") or "", "mode": r.get("mode") or "",
+            "preferred": "+".join(r.get("preferred") or []), "model": r["model"],
+            "served_model": r.get("served_model") or "", "rep": r.get("rep") or 1,
+            "prompt_sha": r.get("prompt_sha") or "", "template_sha": r.get("template_sha") or "",
+            "harness_commit": r.get("harness_commit") or "", "status": r.get("status") or "",
+            "ok": int(bool(r.get("ok"))), "invalid_answer": int(bool(r.get("invalid_answer")))}
+    rows = []
+
+    def add(kind, name="", version="", value="", cap=2000):
+        rows.append({**base, "kind": kind, "name": one_line(name, 300), "version": one_line(version, 300),
+                     "value": one_line(value, cap)})
+
+    for k in ("wall_s", "api_ms", "cost_usd", "files", "spark_version"):
+        add("run", k, value=r.get(k))
+    for k, v in (r.get("usage") or {}).items():
+        if isinstance(v, (int, float)):
+            add("usage", k, value=v)
+    for lang, loc in (r.get("languages") or {}).items():
+        add("language", lang, (r.get("language_versions") or {}).get(lang), loc)
+    tool_versions = r.get("tool_versions") or {}
+    for lib in r.get("libraries") or []:
+        add("library", lib, tool_versions.get(lib), 1)
+    for t in r.get("preferred") or []:
+        add("preferred", t, tool_versions.get(t), int(t in (r.get("libraries") or [])))
+    for pkg, ver in (r.get("versions") or {}).items():
+        add("pin", pkg, ver)
+    for tool, n in (r.get("tools") or {}).items():
+        add("agent_tool", tool, value=n)
+    for i, c in enumerate(r.get("shell_commands") or []):
+        add("shell_command", i, value=c)
+    ans = r.get("answer")
+    if isinstance(ans, dict):  # ask style: the raw answer, before any normalization
+        for c in ans.get("components") or []:
+            if isinstance(c, dict):
+                add("answer_component", c.get("name"), c.get("version"), c.get("role"))
+        for entry in ans.get("languages") or []:
+            name, ver = (entry.get("name"), entry.get("version")) if isinstance(entry, dict) else (entry, "")
+            add("answer_language", name, ver)
+        if ans.get("rationale"):
+            add("rationale", value=ans["rationale"])
+    if r.get("prompt"):
+        add("prompt", r.get("prompt_sha"), value=r["prompt"], cap=None)  # the exact text, so a sha is never opaque
+    return rows
+
+
+def shared_ids(path):
+    if not path.exists():
+        return set()
+    with path.open(newline="") as f:
+        return {row["run_id"] for row in csv.DictReader(f)}
+
+
+def append_shared(path, rows):
+    """Append under an exclusive lock, so several bakeoffs can share one file."""
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="") as f:
+        if fcntl:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        w = csv.DictWriter(f, fieldnames=SHARED_FIELDS)
+        if os.fstat(f.fileno()).st_size == 0:
+            w.writeheader()
+        w.writerows(rows)
+        f.flush()
+
+
+def sync_shared(path, results, out):
+    """Add any run in this tally that the shared CSV doesn't have yet (older runs, or a new shared file)."""
+    have = shared_ids(path)
+    missing = [r for r in results if run_id(r) not in have]
+    append_shared(path, [row for r in missing for row in observations(r, out)])
+    return len(missing)
+
+
+def harness_commit():
+    """Git commit of this script + prompts, with -dirty if either has uncommitted changes."""
+    here = str(Path(__file__).resolve().parent)
+    try:
+        head = subprocess.run(["git", "-C", here, "rev-parse", "--short=12", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", here, "status", "--porcelain", "--", Path(__file__).name, "prompts"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return head + ("-dirty" if dirty else "")
+
+
 def canonical(tool):
     label = LABELS.get(tool.lower())
     if not label:
@@ -774,7 +902,7 @@ def canonical(tool):
 
 def plan_runs(tasks, styles, modes, prefer_override):
     runs = []
-    for task, (prefer, body) in tasks.items():
+    for task, (prefer, body, template_sha) in tasks.items():
         tools = prefer_override or [canonical(t) for t in prefer]
         if "prefer" in modes and not tools:
             print(f"warning: {task} has no `prefer:` header and no --prefer given; skipping prefer mode",
@@ -785,9 +913,13 @@ def plan_runs(tasks, styles, modes, prefer_override):
                     continue
                 used = tools if mode == "prefer" else []
                 prompt = render(body, mode, used)
+                if style == "ask":
+                    prompt = ASK.replace("{task}", prompt.rstrip("\n"))
+                # prompt_sha: the exact text the agent got (task file + mode line + ask trailer);
+                # template_sha: the task file alone, so edits to a task show up across all its variants
                 runs.append({"task": task, "style": style, "mode": mode, "preferred": used,
-                             "variant": variant_name(style, mode, used),
-                             "prompt": ASK.replace("{task}", prompt.rstrip("\n")) if style == "ask" else prompt})
+                             "variant": variant_name(style, mode, used), "prompt": prompt,
+                             "prompt_sha": sha(prompt), "template_sha": template_sha})
     return runs
 
 
@@ -796,6 +928,9 @@ def main():
     ap.add_argument("--out", default="bakeoff",
                     help="run root; each run gets a fresh <out>/<task>/<variant>/<model>. Rerun with the same dir to resume")
     ap.add_argument("--csv", help="running tally (default <out>/tally.csv); runs already in it are skipped")
+    ap.add_argument("--shared-csv", default=SHARED_CSV,
+                    help="long-format observations CSV that every run from every --out appends to, for analytics "
+                         "across runs (default $BAKEOFF_SHARED_CSV or %(default)s; '' turns it off)")
     ap.add_argument("--tasks", help="comma-separated task names (prompts/<name>.md) or prompt file paths; default all")
     ap.add_argument("--prompts-dir", default=str(PROMPTS_DIR), help="where task prompts live (default %(default)s)")
     ap.add_argument("--mode", choices=(*MODES, "both"), default="both",
@@ -809,8 +944,9 @@ def main():
     ap.add_argument("--match", help="regex filter on the model list (e.g. 'sonnet|opus')")
     ap.add_argument("--no-extras", action="store_true", help="skip the cortex + claude runs at the end")
     ap.add_argument("--timeout", type=int, default=3600, help="per-run seconds")
-    ap.add_argument("--repeats", type=int, default=1,
-                    help="runs per (task, variant, model), to measure how consistent each model's choices are. "
+    ap.add_argument("--repeats", type=int, default=3,
+                    help="runs per (task, variant, model) (default %(default)s), to measure how consistent each "
+                         "model's choices are. "
                          "All repeat-1 runs go first, then repeat 2, and so on. Raising it on a resumed run adds "
                          "only the new repeats")
     ap.add_argument("--dry-run", action="store_true", help="print the (task, variant, model) runs and exit")
@@ -829,6 +965,7 @@ def main():
     root = Path(a.out).resolve()
     tally = Path(a.csv) if a.csv else root / "tally.csv"
     results = load_tally(tally)
+    shared = Path(a.shared_csv) if a.shared_csv else None
     done = {(r["task"], r["variant"], r["model"], r["rep"]) for r in results}
 
     models = a.models.split(",") if a.models else list_models()
@@ -849,6 +986,11 @@ def main():
         return 0
 
     root.mkdir(parents=True, exist_ok=True)
+    harness = harness_commit()
+    if shared:
+        added = sync_shared(shared, results, root.name)
+        if added:
+            print(f"added {added} earlier run(s) from {tally} to {shared}", flush=True)
     for i, (run, m, rep) in enumerate(todo, 1):
         key = (run["task"], run["variant"], m, rep)
         label = f"{run['task']} / {run['variant']} / {m}" + (f" #{rep}" if rep > 1 else "")
@@ -857,9 +999,12 @@ def main():
             continue
         print(f"[{i}/{len(todo)}] {label} ...", flush=True)
         r = run_one(run, m, root, a.timeout, rep)
+        r["harness_commit"] = harness
         print(f"    {r['status']} {r['wall_s']}s langs={list(r['languages'])} libs={r['libraries']}"
               + (f" preferred: {preferred_cell(r)}" if r["preferred"] else ""), flush=True)
         results.append(r)
+        if shared:
+            append_shared(shared, observations(r, root.name))
         write_tally(tally, results)
         done.add(key)
         (root / "results.json").write_text(json.dumps(results, indent=1))
