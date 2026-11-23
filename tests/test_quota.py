@@ -176,6 +176,17 @@ def test_gives_up_and_a_rerun_catches_up(tmp_path: Path, fake_bin: Path) -> None
     assert len(shared_runs(tmp_path)) == 2
 
 
+def test_quota_error_then_a_hang_until_the_timeout(tmp_path: Path, fake_bin: Path,
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    (fake_bin / "claude").write_text(f"#!{sys.executable}\nimport sys, time\n"
+                                     "print('Error: usage limit reached, retrying', file=sys.stderr, flush=True)\n"
+                                     "time.sleep(30)\n")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    run = {"task": "t", "variant": "ask-float", "style": "ask", "prompt": "hi"}
+    with pytest.raises(ab.QuotaExhausted, match="usage limit reached"):
+        ab.run_one(run, "claude", tmp_path / "out", timeout=1)
+
+
 def test_quota_stop_before_any_run_records_nothing(tmp_path: Path, fake_bin: Path) -> None:
     p = bakeoff(tmp_path, fake_bin, "quota", "--quota-retries", "0")
     assert p.returncode == ab.QUOTA_EXIT and calls(tmp_path) == 1

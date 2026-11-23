@@ -662,9 +662,9 @@ def run_one(run: Run, model: str, root: Path, timeout: int, rep: int = 1) -> Res
     try:
         p = subprocess.run(cmd, cwd=wd, capture_output=True, text=True, timeout=timeout)
         stream, err, status, code = p.stdout, p.stderr, f"exit {p.returncode}", p.returncode
-    except subprocess.TimeoutExpired as e:
-        stream = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err, status, code = "", "TIMEOUT", None
+    except subprocess.TimeoutExpired as e:  # its output so far, as bytes even with text=True
+        stream, err = (x.decode(errors="replace") if isinstance(x, bytes) else (x or "") for x in (e.stdout, e.stderr))
+        status, code = "TIMEOUT", None  # stderr too: a CLI can report a quota error, then hang until the timeout
     stream_file = wd.parent / f"{wd.name}.stream.jsonl"
     stream_file.write_text(stream)
     (wd.parent / f"{wd.name}.prompt.txt").write_text(prompt)
