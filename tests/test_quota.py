@@ -13,6 +13,8 @@ import agent_bakeoff as ab
 
 REPO = Path(__file__).resolve().parent.parent
 LIMIT = "You've hit your session limit · resets 3pm (America/Los_Angeles)"
+GATEWAY = ('API Error: 403 {"error":{"message":"Your access to this AI Gateway is blocked as you have exceeded '
+           'the usage limit for this key."}}')
 
 
 def events(*evs: dict[str, Any]) -> str:
@@ -37,6 +39,10 @@ def result(text: str, is_error: bool) -> dict[str, Any]:
     ("", "Error: You've hit your usage limit for this month.\n", 1, "hit your usage limit"),  # stderr, no events
     ("API Error: 429 Too Many Requests\n", "", 1, "429"),  # non-JSON stdout
     (events({"type": "error", "message": "Monthly quota exceeded"}), "", 1, "quota"),
+    # an AI gateway in front of the API, as Claude Code surfaces it and as plain stderr
+    (events(said(GATEWAY, "unknown"), result(GATEWAY, True)), "", 1, "exceeded the usage"),
+    ("", "Your access to this AI Gateway is blocked as you have exceeded the usage.....\n", 1, "AI Gateway"),
+    ("", "Error: you have exceeded your monthly budget for this key\n", 1, "monthly budget"),
 ])
 def test_quota_error_found(stream: str, stderr: str, code: int, want: str) -> None:
     reason = ab.quota_error(stream, stderr, code)
@@ -54,6 +60,7 @@ def test_quota_error_found(stream: str, stderr: str, code: int, want: str) -> No
             result("API Error: 500 Internal server error", True)), "", 1),
     ("", "Approaching usage limit · resets 3pm\nTraceback: ConnectionResetError\n", 1),  # a warning, then a crash
     ("", "You've used 90% of your weekly limit\n", 1),
+    ("", "Your access to this AI Gateway is blocked by your organization's policy\n", 1),  # not a quota
 ])
 def test_quota_error_not_found(stream: str, stderr: str, code: int | None) -> None:
     assert ab.quota_error(stream, stderr, code) is None

@@ -567,7 +567,8 @@ def summarize(stream: str, workdir: Path, style: str = "build") -> Result:
 QUOTA_RX = re.compile(
     r"usage limit|rate[ _-]?limit|quota|too many requests|\b(?:error|status|code)\W{0,3}429\b|hit your [\w ]{0,30}limit"
     r"|\b(?:session|weekly|daily|monthly|spend(?:ing)?|plan|opus|sonnet) limit\b"
-    r"|out of (?:extra usage|usage|credits?)|credit balance|insufficient (?:credits?|balance|funds)", re.I)
+    r"|out of (?:extra usage|usage|credits?)|credit balance|insufficient (?:credits?|balance|funds)"
+    r"|exceeded (?:the |your |its )?(?:\w+ ){0,2}(?:usage|quota|budget|spend|limit)", re.I)  # also AI gateways' caps
 QUOTA_WARNING_RX = re.compile(r"approaching|you've used \d|close to|now using extra usage", re.I)  # still running
 QUOTA_ERRORS = {"rate_limit", "billing_error"}  # Claude Code's `error` on the assistant message a run ends with
 QUOTA_EXIT = 75  # EX_TEMPFAIL from sysexits.h: try again later

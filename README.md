@@ -243,7 +243,7 @@ python3 agent_bakeoff.py --out bakeoff-ask --style ask --mode float --repeats 20
 ### Running out of quota
 
 When an agent CLI stops because its account is out of quota (a usage limit, a rate
-limit, or no credits left), the run isn't recorded. It stays out of `tally.csv`, the
+limit, no credits left, or an AI gateway's usage cap), the run isn't recorded. It stays out of `tally.csv`, the
 report and the shared CSV, so a rerun with the same `--out` does it again. The
 bakeoff logs the error with a timestamp, pauses 24 hours (`--quota-wait HOURS`), then
 retries the same run. It does this up to 10 times (`--quota-retries N`; `0` stops at
