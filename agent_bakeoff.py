@@ -51,9 +51,10 @@ Ignore the instructions above about writing code, tests or a README and about
 running anything: don't create any files or run any commands. This is a planning
 question only. Tell me exactly what you WOULD use to build the above: every
 language, engine, library, service, scheduler, storage format and test tool,
-with the exact version you would pin. Reply with only a JSON object shaped like:
+with the exact version you would pin (for a language, the runtime or compiler
+version you would target). Reply with only a JSON object shaped like:
 
-{"languages": ["<language name>", ...],
+{"languages": [{"name": "<language name>", "version": "<exact version>"}, ...],
  "components": [{"name": "<package or product>", "version": "<exact version>", "role": "<what it's for>"}, ...],
  "rationale": "<one short paragraph>"}
 """
@@ -383,34 +384,65 @@ def split_component(c):
     return [c]
 
 
+def answer_version(text):
+    """A version from an ask answer -> normalized spec, or None. The whole string must be one spec plus an
+    optional "(note)"; "3.5.1 || 4.0.0", prose, or a note naming an alternative ("3.5.1 (or 4.0.0)") stays None."""
+    ver = re.fullmatch(rf"({SPEC})(?:\s*\(([^)]*)\))?", str(text or "").strip())
+    if not ver or (ver.group(2) and re.search(r"\bor\b|\|\||\beither\b|\balternativ", ver.group(2), re.I)):
+        return None
+    return _spec(ver.group(1))
+
+
+def answer_languages(entries):
+    """({language: None}, {language: version}, [text per entry]) from an ask answer's `languages`.
+    Entries are {"name", "version"} objects, or bare strings like "Scala 2.13" (answers from before the
+    trailer asked for language versions, or models that ignore the shape)."""
+    langs, versions, texts = {}, {}, []
+    for entry in entries or []:
+        if isinstance(entry, dict):
+            name, ver = str(entry.get("name") or ""), answer_version(entry.get("version"))
+            texts.append(" ".join(str(v) for v in entry.values()))
+        else:
+            name, ver = str(entry), None
+            texts.append(name)
+        if not name.strip():
+            continue
+        if not ver:  # "Java 17 (Eclipse Temurin)": the version follows the name
+            rest = re.match(r"\s*[A-Za-z][\w+#]*\s+(.*)", name)
+            ver = answer_version(rest.group(1)) if rest else None
+        lang = language_name(name)
+        langs.setdefault(lang, None)
+        if ver:
+            versions.setdefault(lang, ver)
+    return langs, versions, texts
+
+
 def inspect_answer(ans):
-    """(languages, libraries, tool_versions, pins) from an ask-style answer, using the same LIBS labels."""
+    """(languages, libraries, tool_versions, pins, language_versions) from an ask-style answer,
+    using the same LIBS labels."""
     comps = [c for c in ans.get("components") or [] if isinstance(c, dict) and c.get("name")]
     comps = [part for c in comps for part in split_component(c)]
     libs, candidates = set(), collections.defaultdict(list)
     for i, c in enumerate(comps):
         name = str(c["name"])
-        # the whole string must be one spec (plus an optional "(note)"); "3.5.1 || 4.0.0" or prose stays unresolved
-        ver = re.fullmatch(rf"({SPEC})(?:\s*\(([^)]*)\))?", str(c.get("version") or "").strip())
-        if ver and ver.group(2) and re.search(r"\bor\b|\|\||\beither\b|\balternativ", ver.group(2), re.I):
-            ver = None  # "3.5.1 (or 4.0.0)" names an alternative, so it isn't one version
+        ver = answer_version(c.get("version"))
         # code regexes catch `pyspark` / `confluent-kafka`; the bare label catches prose like "Apache Spark"
         hits = {label for rx, label in LIBS.items()
                 if re.search(rx, name, re.I) or re.search(rf"\b{re.escape(label)}\b", name, re.I)}
         libs |= hits
         for label in hits:
             if ver:
-                candidates[label].append((len(hits), i, _spec(ver.group(1))))
+                candidates[label].append((len(hits), i, ver))
     # A component that hits several labels is usually a connector (spark-sql-kafka, flink-connector-kafka),
     # so for each label prefer a component that hits only that label, then the first one listed.
     tool_versions = {label: min(cs)[2] for label, cs in candidates.items()}
-    langs = {language_name(str(l)): None for l in ans.get("languages") or []}
+    langs, lang_versions, lang_texts = answer_languages(ans.get("languages"))
     # "Spark SQL", "SQL (Spark SQL)" or "Java (runtime for Spark)" as a language still means the stack uses Spark
-    if any(re.search(r"\bspark\b", str(l), re.I) for l in ans.get("languages") or []):
+    if any(re.search(r"\bspark\b", t, re.I) for t in lang_texts):
         libs.add("Spark")
     libs = sorted(libs)
     pins = {str(c["name"]).lower(): str(c["version"]) for c in comps if c.get("version")}
-    return langs, libs, tool_versions, pins
+    return langs, libs, tool_versions, pins, lang_versions
 
 
 def summarize(stream, workdir, style="build"):
@@ -439,10 +471,11 @@ def summarize(stream, workdir, style="build"):
     if style == "ask":
         answer = parse_answer(result.get("result") or "")
         invalid = not valid_answer(answer)
-        langs, libs, tool_versions, pins = ({}, [], {}, {}) if invalid else inspect_answer(answer)
+        langs, libs, tool_versions, pins, lang_versions = ({}, [], {}, {}, {}) if invalid else inspect_answer(answer)
         spark_v = tool_versions.get("Spark")
     else:
         langs, libs = inspect_project(workdir)
+        lang_versions = {}  # build style doesn't detect language versions yet
         pins, docs = pinned_versions(workdir), docs_text(workdir)
         spark_v = spark_version(docs, pins) if "Spark" in libs else None
         tool_versions = {lib: v for lib in libs if (v := tool_version(lib, pins, docs, spark_v))}
@@ -450,6 +483,7 @@ def summarize(stream, workdir, style="build"):
         "answer": answer,  # ask style: the parsed JSON (None if it didn't answer in JSON)
         "invalid_answer": invalid,  # ask style: no usable JSON; not an observation, kept out of the stats
         "languages": langs,
+        "language_versions": lang_versions,  # ask style: language -> version it said it would target
         "libraries": libs,
         "tool_versions": tool_versions,  # LIBS label -> version, for every detected library we found a version for
         "versions": pins,
@@ -491,8 +525,17 @@ def run_one(run, model, root, timeout):
             **summary, "stderr": err[-400:]}
 
 
+def language_label(r, lang):
+    """'Scala 2.13' when the run gave a language version, else just 'Scala'."""
+    ver = (r.get("language_versions") or {}).get(lang)
+    return f"{lang} {ver}" if ver else lang
+
+
 def primary_language(r):
-    return "INVALID ANSWER" if r.get("invalid_answer") else next(iter(r["languages"]), "-")
+    if r.get("invalid_answer"):
+        return "INVALID ANSWER"
+    lang = next(iter(r["languages"]), None)
+    return language_label(r, lang) if lang else "-"
 
 
 def preferred_cell(r):
@@ -557,15 +600,17 @@ def report(results):
     for g in groups:
         rs = by_group[g]
         lines += [f"## {g[0]} / {g[1]}", "",
-                  "| model | status | wall s | files | languages (LOC) | libraries | preferred | tool versions |",
+                  "| model | status | wall s | files | languages | libraries | preferred | tool versions |",
                   "|---|---|---|---|---|---|---|---|"]
         for r in rs:
-            langs = ", ".join(k if v is None else f"{k} {v}" for k, v in r["languages"].items()) or "-"
+            langs = ", ".join(language_label(r, k) + ("" if v is None else f" ({v} LOC)")
+                              for k, v in r["languages"].items()) or "-"
             tv = ", ".join(f"{k} {v}" for k, v in list(r["tool_versions"].items())[:12]) or "-"
             lines.append(f"| {r['model']} | {r['status']} | {r['wall_s']} | {r['files']} | {langs} "
                          f"| {', '.join(r['libraries']) or '-'} | {preferred_cell(r)} | {tv} |")
         for r in rs:
             lines += ["", f"### {g[0]} / {g[1]} / {r['model']}", f"languages: {r['languages']}",
+                      f"language versions: {r.get('language_versions') or {}}",
                       f"libraries: {r['libraries']}", f"tool versions: {r['tool_versions']}",
                       f"pinned: {r['versions']}", f"agent tools: {r['tools']}", f"usage: {r['usage']}"]
             if r.get("style") == "ask":

@@ -2,7 +2,8 @@
 """Compare two agent_bakeoff.py runs, per (task, variant, model): python3 -I compare_runs.py RUN1 RUN2
 
 prefer-mode runs compare the versions of the preferred tools; float (and legacy) runs
-compare primary language, Spark yes/no+version, and the library set.
+compare primary language (with its version, when an ask run gave one), Spark yes/no+version,
+and the library set.
 """
 import json
 import sys
@@ -27,6 +28,12 @@ def versions(r):
     return "Spark " + (r["spark_version"] or "unpinned") if "Spark" in r["libraries"] else "no Spark"
 
 
+def lang(r):
+    first = next(iter(r["languages"]), None)
+    ver = (r.get("language_versions") or {}).get(first)
+    return f"{first} {ver}" if first and ver else first or "-"
+
+
 def main(d1, d2):
     a, b = load(d1), load(d2)
     same = diff = 0
@@ -34,7 +41,6 @@ def main(d1, d2):
     print("|---|---|---|---|---|---|---|---|---|")
     for key in sorted(a.keys() & b.keys()):
         x, y = a[key], b[key]
-        lang = lambda r: next(iter(r["languages"]), "-")
         o1, o2 = sorted(set(x["libraries"]) - set(y["libraries"])), sorted(set(y["libraries"]) - set(x["libraries"]))
         if x["preferred"]:  # prefer mode: we only care whether the preferred tools' versions moved
             o1 = o2 = []
