@@ -61,9 +61,9 @@ def test_identical_old_runs_in_same_named_out_dirs_stay_distinct(tmp_path: Path)
     rows match on every field (a Cursor run reports no API time, cost or usage)."""
     old = {k: v for k, v in make_result().items() if k not in ("started", "api_ms", "cost_usd", "usage")}
     shared = tmp_path / "observations.csv"
-    assert ab.sync_shared(shared, [old], ab.OutDir("bakeoff", "machine-1")) == 1
-    assert ab.sync_shared(shared, [old], ab.OutDir("bakeoff", "machine-2")) == 1
-    assert ab.sync_shared(shared, [old], ab.OutDir("bakeoff", "machine-2")) == 0
+    assert ab.sync_shared(shared, [old], ab.OutDir("bakeoff", "machine-1")) == (1, 0)
+    assert ab.sync_shared(shared, [old], ab.OutDir("bakeoff", "machine-2")) == (1, 0)
+    assert ab.sync_shared(shared, [old], ab.OutDir("bakeoff", "machine-2")) == (0, 0)
 
 
 @pytest.mark.parametrize("answer", [{"components": 42}, {"components": [{"name": "pyspark"}], "languages": 42},
@@ -93,9 +93,9 @@ def test_observations(tmp_path: Path) -> None:
 def test_shared_csv_sync_is_idempotent(tmp_path: Path) -> None:
     shared = tmp_path / "data" / "observations.csv"
     results = [make_result(rep=1), make_result(rep=2)]
-    assert ab.sync_shared(shared, results, OUT) == 2
-    assert ab.sync_shared(shared, results, OUT) == 0
-    assert ab.sync_shared(shared, [*results, make_result(rep=3)], OUT) == 1
+    assert ab.sync_shared(shared, results, OUT) == (2, 0)
+    assert ab.sync_shared(shared, results, OUT) == (0, 0)
+    assert ab.sync_shared(shared, [*results, make_result(rep=3)], OUT) == (1, 0)
     with shared.open(newline="") as f:
         rows = list(csv.DictReader(f))
     assert len({row["run_id"] for row in rows}) == 3
@@ -117,7 +117,7 @@ def test_failed_export_leaves_no_partial_rows(tmp_path: Path, monkeypatch: pytes
         ab.append_shared(shared, ab.observations(second, OUT))
     monkeypatch.undo()
     assert shared.read_bytes() == before  # nothing of the failed run is left behind
-    assert ab.sync_shared(shared, [first, second], OUT) == 1  # so the next sync adds it whole
+    assert ab.sync_shared(shared, [first, second], OUT) == (1, 0)  # so the next sync adds it whole
 
 
 def test_non_ascii_prompt_round_trips(tmp_path: Path) -> None:

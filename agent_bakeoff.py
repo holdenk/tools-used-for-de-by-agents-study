@@ -50,6 +50,11 @@ from typing import Any, NamedTuple, TypeVar
 if sys.platform != "win32":
     import fcntl  # lock the shared CSV while appending
 
+# Nothing we store is truncated, so a field can pass the csv module's 128 KiB default: a tally row holds a run's
+# whole shell-command list, the shared CSV whole responses. Past the limit, reading the tally back fails and the
+# --out dir can't be resumed. 2**31 - 1 is the largest value a C long holds on every platform.
+csv.field_size_limit(2**31 - 1)
+
 Result = dict[str, Any]  # one finished run: what run_one returns, a tally row, a results.json entry
 Run = dict[str, Any]  # one planned (task, style, mode) run, from plan_runs
 Group = tuple[str, str]  # (task, variant)
@@ -77,9 +82,12 @@ ASK = """{task}
 Ignore the instructions above about writing code, tests or a README and about
 running anything: don't create any files or run any commands. This is a planning
 question only. Tell me exactly what you WOULD use to build the above: every
-language, engine, library, service, scheduler, storage format and test tool,
-with the exact version you would pin (for a language, the runtime or compiler
-version you would target). Reply with only a JSON object shaped like:
+language, engine, library, service, scheduler, storage format and test tool
+you would pick, with the exact version you would pin (for a language, the
+runtime or compiler version you would target). Leave out transitive
+dependencies that something you list pulls in automatically, unless you would
+pick or pin one of them explicitly yourself. Reply with only a JSON object
+shaped like:
 
 {"languages": [{"name": "<language name>", "version": "<exact version>"}, ...],
  "components": [{"name": "<package or product>", "version": "<exact version>", "role": "<what it's for>"}, ...],
@@ -110,7 +118,8 @@ def load_tasks(spec: str | None, prompts_dir: Path) -> dict[str, Task]:
     missing = [str(f) for f in files if not f.is_file()]
     if missing:
         sys.exit(f"no such prompt file(s): {', '.join(missing)}")
-    return {f.stem: (*parse_prompt(f.read_text()), sha(f.read_text())) for f in files}
+    texts = {f.stem: f.read_text(encoding="utf-8") for f in files}  # not the locale's: prompts say "µg/m³"
+    return {task: (*parse_prompt(text), sha(text)) for task, text in texts.items()}
 
 
 def sha(text: str) -> str:
@@ -560,7 +569,8 @@ def summarize(stream: str, workdir: Path, style: str = "build") -> Result:
         "cost_usd": result.get("total_cost_usd"),
         "usage": result.get("usage", {}),
         "files": len(project_files(workdir)),
-        "final": (result.get("result") or "")[-600:],
+        "final": result.get("result") or "",  # the whole final message; for ask style, the raw answer
+        "final_truncated": False,  # True only for runs recorded when just the last 600 characters were kept
         "served_model": served,  # from the stream's init event, when the CLI reports one
     }
 
@@ -669,6 +679,20 @@ def run_with_quota_retries(attempt: Callable[[], Result], header: str, retries: 
     return None
 
 
+STDERR_TAIL = 2000  # characters of stderr the tally and report keep; all of it is in <model>.stderr.txt
+
+
+def tail(text: str, limit: int, where: str) -> str:
+    """The end of text, about `limit` characters, starting on a whole line (or failing that a whole word) and saying
+    how much was cut and where the rest is, so a fragment like 'ocker compose' never passes for the whole thing."""
+    if len(text) <= limit:
+        return text
+    kept = text[-limit:]
+    if text[-limit - 1] != "\n" and (start := re.search(r"\n", kept[:-1]) or re.search(r"\s", kept[:-1])):
+        kept = kept[start.end():]  # it began mid-line: start at its next line, or failing that its next word
+    return f"[... {len(text) - len(kept):,} earlier characters cut; all of it is in {where}]\n{kept}"
+
+
 def run_dir_name(model: str, rep: int) -> str:
     """Repeat 1 keeps the plain model name, so tallies and dirs from before --repeats line up."""
     return re.sub(r"[^\w.\-]", "_", model) + ("" if rep == 1 else f".rep{rep}")
@@ -687,15 +711,17 @@ def run_one(run: Run, model: str, root: Path, timeout: int, rep: int = 1) -> Res
     t0 = time.time()
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0))  # for version lag vs releases at run time
     code: int | None
-    try:
-        p = subprocess.run(cmd, cwd=wd, capture_output=True, text=True, timeout=timeout)
+    try:  # UTF-8 whatever the locale, and a stray non-UTF-8 byte becomes U+FFFD instead of crashing the bakeoff
+        p = subprocess.run(cmd, cwd=wd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         stream, err, status, code = p.stdout, p.stderr, f"exit {p.returncode}", p.returncode
     except subprocess.TimeoutExpired as e:  # its output so far, as bytes even with text=True
         stream, err = (x.decode(errors="replace") if isinstance(x, bytes) else (x or "") for x in (e.stdout, e.stderr))
         status, code = "TIMEOUT", None  # stderr too: a CLI can report a quota error, then hang until the timeout
     stream_file = wd.parent / f"{wd.name}.stream.jsonl"
-    stream_file.write_text(stream)
-    (wd.parent / f"{wd.name}.prompt.txt").write_text(prompt)
+    stream_file.write_text(stream, encoding="utf-8")
+    stderr_file = wd.parent / f"{wd.name}.stderr.txt"
+    stderr_file.write_text(err, encoding="utf-8")  # always, so an earlier attempt's never lingers
+    (wd.parent / f"{wd.name}.prompt.txt").write_text(prompt, encoding="utf-8")
     if failure := cli_error(stream, err, code):
         kind, reason = failure
         raise kind(f"{reason} (stream in {stream_file})")
@@ -706,7 +732,7 @@ def run_one(run: Run, model: str, root: Path, timeout: int, rep: int = 1) -> Res
             "preferred": run["preferred"], "model": model, "rep": rep, "started": started, "status": status,
             "wall_s": round(time.time() - t0), "prompt_sha": run["prompt_sha"], "template_sha": run["template_sha"],
             "prompt": prompt,
-            **summary, "stderr": err[-400:]}
+            **summary, "stderr": tail(err, STDERR_TAIL, str(stderr_file.relative_to(root)))}
 
 
 def language_label(r: Result, lang: str) -> str:
@@ -746,6 +772,14 @@ def col(g: Group, rs: Sequence[Result]) -> str:
 def run_label(r: Result) -> str:
     rep = r.get("rep") or 1
     return str(r["model"]) + ("" if rep == 1 else f" #{rep}")
+
+
+def preview(text: str, limit: int) -> str:
+    """A one-line preview for the report: the first line, at most `limit` characters, ending in '…' if anything
+    was left out. The report is a summary; results.json and the shared CSV keep the whole text."""
+    text = text.strip()
+    short = text.split("\n", 1)[0][:limit]
+    return short + (" …" if short != text else "")
 
 
 def tally_cell(values: Sequence[str]) -> str:
@@ -877,6 +911,7 @@ def report(results: Sequence[Result]) -> str:
             langs = ", ".join(language_label(r, k) + ("" if v is None else f" ({v} LOC)")
                               for k, v in r["languages"].items()) or "-"
             tv = ", ".join(f"{k} {v}" for k, v in list(r["tool_versions"].items())[:12]) or "-"
+            tv += ", …" if len(r["tool_versions"]) > 12 else ""
             lines.append(f"| {run_label(r)} | {r['status']} | {r['wall_s']} | {r['files']} | {langs} "
                          f"| {', '.join(r['libraries']) or '-'} | {preferred_cell(r)} | {tv} |")
         for r in rs:
@@ -888,11 +923,14 @@ def report(results: Sequence[Result]) -> str:
                       f"language versions: {r.get('language_versions') or {}}",
                       f"libraries: {r['libraries']}", f"tool versions: {r['tool_versions']}",
                       f"pinned: {r['versions']}", f"agent tools: {r['tools']}", f"usage: {r['usage']}"]
-            if r.get("style") == "ask":
-                lines.append(f"answer: {json.dumps(r.get('answer'))[:2000]}")
-            lines += [f"- `{c[:160]}`" for c in r["shell_commands"][:15]]
-            if r["final"]:
-                lines += ["", "final message tail:", "", "> " + r["final"].replace("\n", "\n> ")]
+            cmds = r["shell_commands"]
+            lines += [f"- `{preview(c, 160)}`" for c in cmds[:15]]
+            if len(cmds) > 15:
+                lines.append(f"- … and {len(cmds) - 15} more shell command(s), all in results.json")
+            if r["final"]:  # for ask style, this is the answer as the agent wrote it
+                head = "final message" + (" (only its last 600 characters were recorded)" if r.get("final_truncated")
+                                          else "")
+                lines += ["", head + ":", "", "> " + r["final"].replace("\n", "\n> ")]
             if r["stderr"].strip():
                 lines += ["", "stderr tail:", "", "    " + r["stderr"].strip().replace("\n", "\n    ")]
         lines.append("")
@@ -905,7 +943,7 @@ PLAIN = ("task", "variant", "style", "mode", "model", "status")  # every other c
 def load_tally(path: Path) -> list[Result]:
     if not path.exists():
         return []
-    with path.open(newline="") as f:
+    with path.open(newline="", encoding="utf-8") as f:
         rows = [{k: v if k in PLAIN else (json.loads(v) if v else None) for k, v in row.items()}
                 for row in csv.DictReader(f)]
     for r in rows:  # rows written before tasks / modes existed
@@ -924,7 +962,7 @@ def write_tally(path: Path, results: Sequence[Result]) -> None:
     """Rewrite the whole tally (it's small) so a column added later never misaligns old rows."""
     fields = list(dict.fromkeys(k for r in results for k in r))
     tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", newline="") as f:
+    with tmp.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in results:
@@ -971,15 +1009,25 @@ def run_id(r: Result, out: OutDir) -> str:
     return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
 
 
-def one_line(v: object, cap: int | None = None) -> str:
-    """CSV-safe scalar: no raw newlines, so every observation is one physical line for any CSV reader."""
-    text = "" if v is None else str(v).replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
-    return text[:cap] if cap else text
+def one_line(v: object) -> str:
+    """CSV-safe scalar: no raw newlines, so every observation is one physical line for any CSV reader. Never cut."""
+    return "" if v is None else str(v).replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
+
+
+def flatten(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """{'cache_creation': {'ephemeral_5m_input_tokens': 3}} -> {'cache_creation.ephemeral_5m_input_tokens': 3}"""
+    flat: dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            flat.update(flatten(v, f"{prefix}{k}."))
+        else:
+            flat[f"{prefix}{k}"] = v
+    return flat
 
 
 def observations(r: Result, out: OutDir) -> list[dict[str, Any]]:
     """One row per fact about a run: kind = run | usage | language | library | preferred | pin | agent_tool |
-    shell_command | answer_component | answer_language | rationale | prompt."""
+    shell_command | answer_component | answer_language | rationale | response | prompt. No value is ever cut."""
     base = {"run_id": run_id(r, out), "out": out.name, "out_id": out.id, "started": r.get("started") or "", "task": r["task"],
             "variant": r["variant"], "style": r.get("style") or "", "mode": r.get("mode") or "",
             "preferred": "+".join(r.get("preferred") or []), "model": r["model"],
@@ -989,13 +1037,14 @@ def observations(r: Result, out: OutDir) -> list[dict[str, Any]]:
             "ok": int(bool(r.get("ok"))), "invalid_answer": int(bool(r.get("invalid_answer")))}
     rows = []
 
-    def add(kind: str, name: object = "", version: object = "", value: object = "", cap: int | None = 2000) -> None:
-        rows.append({**base, "kind": kind, "name": one_line(name, 300), "version": one_line(version, 300),
-                     "value": one_line(value, cap)})
+    def add(kind: str, name: object = "", version: object = "", value: object = "") -> None:
+        rows.append({**base, "kind": kind, "name": one_line(name), "version": one_line(version),
+                     "value": one_line(value)})
 
     for k in ("wall_s", "api_ms", "cost_usd", "files", "spark_version"):
         add("run", k, value=r.get(k))
-    for k, v in (r.get("usage") or {}).items():
+    usage = r.get("usage")
+    for k, v in flatten(usage if isinstance(usage, dict) else {}).items():  # nested counters too
         if isinstance(v, (int, float)):
             add("usage", k, value=v)
     for lang, loc in (r.get("languages") or {}).items():
@@ -1022,16 +1071,21 @@ def observations(r: Result, out: OutDir) -> list[dict[str, Any]]:
             add("answer_language", name, ver)
         if ans.get("rationale"):
             add("rationale", value=ans["rationale"])
+    if r.get("final") and not r.get("final_truncated"):  # the whole final message; for ask style, the raw answer,
+        add("response", value=r["final"])  # so an answer we couldn't parse is still there to read
     if r.get("prompt"):
-        add("prompt", r.get("prompt_sha"), value=r["prompt"], cap=None)  # the exact text, so a sha is never opaque
+        add("prompt", r.get("prompt_sha"), value=r["prompt"])  # the exact text, so a sha is never opaque
     return rows
 
 
-def shared_ids(path: Path) -> set[str]:
-    if not path.exists():
-        return set()
-    with path.open(newline="", encoding="utf-8") as f:
-        return {row["run_id"] for row in csv.DictReader(f)}
+def shared_kinds(path: Path) -> dict[str, set[str]]:
+    """run_id -> the kinds of fact the shared CSV has for that run."""
+    kinds: dict[str, set[str]] = collections.defaultdict(set)
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                kinds[row["run_id"]].add(row["kind"])
+    return dict(kinds)
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -1043,7 +1097,7 @@ def _write_all(fd: int, data: bytes) -> None:
 def append_shared(path: Path, rows: Sequence[dict[str, Any]]) -> None:
     """Append one run's rows all or nothing, under an exclusive lock so several bakeoffs can share one file.
     If the write fails partway (a full disk, say), the file is cut back to where it was, so no run is ever half
-    exported: shared_ids would see its id and sync_shared would never add the missing rows."""
+    exported: shared_kinds would see its id and sync_shared would never add the missing rows."""
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1066,12 +1120,65 @@ def append_shared(path: Path, rows: Sequence[dict[str, Any]]) -> None:
         os.close(fd)
 
 
-def sync_shared(path: Path, results: Sequence[Result], out: OutDir) -> int:
-    """Add any run in this tally that the shared CSV doesn't have yet (older runs, or a new shared file)."""
-    have = shared_ids(path)
-    missing = [r for r in results if run_id(r, out) not in have]
-    append_shared(path, [row for r in missing for row in observations(r, out)])
-    return len(missing)
+LATE_KINDS = {"response"}  # kinds of fact added after runs were exported without them: sync adds them to those runs
+
+
+def sync_shared(path: Path, results: Sequence[Result], out: OutDir) -> tuple[int, int]:
+    """Add any run in this tally that the shared CSV doesn't have yet (older runs, or a new shared file), and any
+    LATE_KINDS fact a run already there is missing. -> (runs added, runs given late facts)."""
+    have = shared_kinds(path)
+    rows: list[dict[str, Any]] = []
+    added = filled = 0
+    for r in results:
+        facts = observations(r, out)
+        kinds = have.get(run_id(r, out))
+        if kinds is None:
+            rows += facts
+            added += 1
+        elif late := [row for row in facts if row["kind"] in LATE_KINDS - kinds]:
+            rows += late
+            filled += 1
+    append_shared(path, rows)
+    return added, filled
+
+
+OLD_FINAL_CAP = 600  # runs recorded before whole final messages were kept have only this many, the last ones
+
+
+def final_message(stream: str) -> str | None:
+    """The final message in a saved stream (its last result event's), or None if it has no result event."""
+    final = None
+    for line in stream.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "result":
+            final = str(ev.get("result") or "")
+    return final
+
+
+def recover_finals(results: Sequence[Result], root: Path) -> int:
+    """Rows recorded when only a final message's last 600 characters were kept often start mid-word ('ocker
+    compose'). Restore the whole message from the run's saved stream when that stream's message ends with what was
+    recorded; otherwise mark the row final_truncated. Every row gets final_truncated set. -> rows restored."""
+    restored = 0
+    for r in results:
+        if r.get("final_truncated") is not None:
+            continue
+        final = r.get("final") or ""
+        r["final_truncated"] = len(final) >= OLD_FINAL_CAP  # shorter ones were never cut
+        if not r["final_truncated"]:
+            continue
+        stream = root / r["task"] / r["variant"] / f"{run_dir_name(r['model'], r.get('rep') or 1)}.stream.jsonl"
+        try:
+            whole = final_message(stream.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if whole is not None and whole.endswith(final):  # the same run, not a later attempt that overwrote it
+            r["final"], r["final_truncated"] = whole, False
+            restored += 1
+    return restored
 
 
 def harness_commit() -> str:
@@ -1191,10 +1298,18 @@ def main() -> int:
     root.mkdir(parents=True, exist_ok=True)
     out = out_dir(root)
     harness = harness_commit()
+    if any(r.get("final_truncated") is None for r in results):  # rows from before whole final messages were kept
+        restored = recover_finals(results, root)
+        write_tally(tally, results)
+        if restored:
+            print(f"restored the whole final message of {restored} earlier run(s) from their saved streams",
+                  flush=True)
     if shared:
-        added = sync_shared(shared, results, out)
+        added, filled = sync_shared(shared, results, out)
         if added:
             print(f"added {added} earlier run(s) from {tally} to {shared}", flush=True)
+        if filled:
+            print(f"added the whole final message of {filled} earlier run(s) to {shared}", flush=True)
     out_of_quota: str | None = None  # the model we gave up on, and how many runs that left undone
     left = 0
     blocked: Counter[str] = Counter()  # model -> runs skipped because its access was blocked
@@ -1229,11 +1344,11 @@ def main() -> int:
             except (OSError, ValueError, TypeError) as e:  # the next invocation's sync_shared backfills it
                 print(f"    warning: couldn't add this run to {shared}: {e}", file=sys.stderr, flush=True)
         done.add(key)
-        (root / "results.json").write_text(json.dumps(results, indent=1))
-        (root / "report.md").write_text(report(results))
+        (root / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
+        (root / "report.md").write_text(report(results), encoding="utf-8")
     if results:  # also repairs exports when a resumed run had nothing left to do
-        (root / "results.json").write_text(json.dumps(results, indent=1))
-        (root / "report.md").write_text(report(results))
+        (root / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
+        (root / "report.md").write_text(report(results), encoding="utf-8")
     if blocked:
         print(f"\nACCESS BLOCKED for {sum(blocked.values())} run(s), none of them recorded: "
               + ", ".join(f"{m} ×{n}" for m, n in blocked.most_common())

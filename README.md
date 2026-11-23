@@ -68,8 +68,10 @@ Both modes ask the agent to pin dependency versions.
 - **ask** (`--style ask`): much cheaper. The agent gets the same task prompt, plus a
   trailer telling it not to write anything and to reply with only JSON
   (`languages: [{name, version}]`, `components: [{name, version, role}]`,
-  `rationale`), with an exact version for every language and component. That answer
-  goes through the same library and version detection, under an `ask-` variant
+  `rationale`), with an exact version for every language and component. It's told to
+  leave out transitive dependencies that something it lists pulls in automatically,
+  unless it would pick or pin one explicitly, so the list is its choices, not their
+  dependency trees. That answer goes through the same library and version detection, under an `ask-` variant
   (`ask-float`, `ask-prefer-spark+kafka`). The report marks those columns `[ask]`.
   What an agent says it would use and what it ends up using can differ, so
   `--style both` lets you compare the two.
@@ -160,11 +162,18 @@ folders with the same name, such as every machine's default `bakeoff`, so
 | `answer_component` | ask style: raw component name | raw version | role |
 | `answer_language` | ask style: raw language name | raw version | |
 | `rationale` | | | ask style: the agent's reasoning |
+| `response` | | | the agent's whole final message (ask style: its raw answer, parsable or not) |
 | `prompt` | `prompt_sha` | | the full prompt text |
 
+`usage` includes nested counters under dotted names, e.g.
+`cache_creation.ephemeral_5m_input_tokens`.
+
 Values never contain raw newlines: a newline is written as `\n` and a backslash as
-`\\`, so every row is one physical line. Long text is capped at 2,000 characters,
-except the prompt. For example, in PySpark:
+`\\`, so every row is one physical line. Nothing is cut, so a value can be long (a
+shell command that writes a whole file). Spark and pandas read it as is. Python's
+`csv` module stops at 128 KiB per field unless you raise `csv.field_size_limit()`.
+Rows exported before this have a `rationale`, `shell_command` or `role` capped at 2,000
+characters and a name or version capped at 300. For example, in PySpark:
 
 ```python
 from pyspark.sql import functions as F
@@ -228,12 +237,19 @@ python3 agent_bakeoff.py --out bakeoff-ask --style ask --mode float --repeats 20
   doesn't collide with default-preference runs.
 - Output goes to `<out>/<task>/<variant>/<model>/` (the agent's workspace) and
   `<out>/<task>/<variant>/<model>.stream.jsonl` (its raw stream), with the exact
-  prompt in `<model>.prompt.txt`. The variant is `float` or `prefer-<tools>`.
-  Repeats after the first go to `<model>.rep<N>/`.
+  prompt in `<model>.prompt.txt` and the CLI's whole stderr in `<model>.stderr.txt`. The
+  variant is `float` or `prefer-<tools>`. Repeats after the first go to `<model>.rep<N>/`.
 - `<out>/report.md` has the prefer-mode version tables, the float-mode tool tables,
-  the convergence table, then per-(task, variant) details. With repeats, a pivot
-  cell lists each distinct answer with its count (`Spark 3.5.1 ×3; Spark 4.0.1 ×1`).
-  `<out>/results.json` has everything.
+  the convergence table, then per-(task, variant) details, including each run's whole
+  final message. With repeats, a pivot cell lists each distinct answer with its count
+  (`Spark 3.5.1 ×3; Spark 4.0.1 ×1`). `<out>/results.json` has everything. Where the
+  report shortens something (a shell command, a stderr tail), it says so with `…` and
+  where the full text is.
+- Runs recorded before whole final messages were kept have only the last 600
+  characters, which often start mid-word ("ocker compose up"). A run with that `--out`
+  restores the whole message from each run's saved `<model>.stream.jsonl` (when the
+  stream's message ends with what was recorded) and adds it to the shared CSV. The
+  report marks the ones it can't restore.
 - `<out>/tally.csv` is the resume point: rerun with the same `--out` and any
   (task, variant, model, repeat) already in it is skipped, so raising `--repeats`
   adds only the new repeats. Rows from before `--repeats` count as repeat 1.
