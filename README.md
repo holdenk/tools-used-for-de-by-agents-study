@@ -138,9 +138,14 @@ CSV existed get added, once. Appends take a file lock, so parallel bakeoffs can
 share one file.
 
 One row per fact about a run. Every row repeats the run's identity, so you can
-filter and group without joins: `run_id, out, started, task, variant, style, mode,
-preferred, model, served_model, rep, prompt_sha, template_sha, harness_commit,
-status, ok, invalid_answer`. Then `kind, name, version, value` describe the fact:
+filter and group without joins: `run_id, out, out_id, started, task, variant, style,
+mode, preferred, model, served_model, rep, prompt_sha, template_sha, harness_commit,
+status, ok, invalid_answer`. Then `kind, name, version, value` describe the fact.
+
+`out` is the `--out` folder's name. `out_id` is a random ID the folder gets on its
+first run, kept in `<out>/.bakeoff-id`. It moves with the folder and differs between
+folders with the same name, such as every machine's default `bakeoff`, so
+`run_id` stays unique and stable across them.
 
 | kind | name | version | value |
 |---|---|---|---|

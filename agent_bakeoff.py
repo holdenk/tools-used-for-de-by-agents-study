@@ -34,10 +34,11 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 if sys.platform != "win32":
     import fcntl  # lock the shared CSV while appending
@@ -817,16 +818,38 @@ def write_tally(path: Path, results: Sequence[Result]) -> None:
 
 # --- shared observations CSV: every run from every --out, in one long-format file for later analytics
 SHARED_CSV = os.environ.get("BAKEOFF_SHARED_CSV") or str(Path(__file__).resolve().parent / "data" / "observations.csv")
-SHARED_FIELDS = ["run_id", "out", "started", "task", "variant", "style", "mode", "preferred", "model",
+SHARED_FIELDS = ["run_id", "out", "out_id", "started", "task", "variant", "style", "mode", "preferred", "model",
                  "served_model", "rep", "prompt_sha", "template_sha", "harness_commit", "status", "ok",
                  "invalid_answer", "kind", "name", "version", "value"]
 
 
-def run_id(r: Result, out: str) -> str:
-    """Stable for a finished run (a tally row syncs to the same id, even after its --out dir moves), and distinct
-    between runs. Besides the cell and repeat, it hashes what each run measured (start time, durations, cost, files,
-    token usage), so runs from before `started` existed stay distinct even in two --out dirs with the same name."""
-    key = [out, r["task"], r["variant"], r.get("style"), r["model"], r.get("rep") or 1, r.get("started") or "",
+class OutDir(NamedTuple):
+    """An --out dir as the shared CSV sees it: its name, for people, and a persistent id, for run ids."""
+    name: str
+    id: str
+
+
+def out_dir(root: Path) -> OutDir:
+    """root's OutDir. The id is random, made on first use and kept in <root>/.bakeoff-id, so it moves with the
+    folder and differs between folders, even same-named ones (every machine's default is `bakeoff`)."""
+    marker = root / ".bakeoff-id"
+    if not marker.exists():
+        tmp = root / f".bakeoff-id.{uuid.uuid4().hex}"
+        tmp.write_text(uuid.uuid4().hex[:16] + "\n")
+        try:
+            os.link(tmp, marker)  # atomic create-if-absent, so a concurrent bakeoff never reads a half-written id
+        except FileExistsError:
+            pass
+        finally:
+            tmp.unlink()
+    return OutDir(root.name, marker.read_text().strip())
+
+
+def run_id(r: Result, out: OutDir) -> str:
+    """Stable for a finished run (a tally row syncs to the same id, even after its --out dir moves or is renamed),
+    and distinct between runs: it hashes the --out dir's persistent id, the cell and repeat, and what the run
+    measured, so even runs from tallies that predate `started` can't collide across dirs."""
+    key = [out.id, r["task"], r["variant"], r.get("style"), r["model"], r.get("rep") or 1, r.get("started") or "",
            r.get("wall_s"), r.get("status"), r.get("api_ms"), r.get("cost_usd"), r.get("files"),
            json.dumps(r.get("usage") or {}, sort_keys=True)]
     return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
@@ -838,10 +861,10 @@ def one_line(v: object, cap: int | None = None) -> str:
     return text[:cap] if cap else text
 
 
-def observations(r: Result, out: str) -> list[dict[str, Any]]:
+def observations(r: Result, out: OutDir) -> list[dict[str, Any]]:
     """One row per fact about a run: kind = run | usage | language | library | preferred | pin | agent_tool |
     shell_command | answer_component | answer_language | rationale | prompt."""
-    base = {"run_id": run_id(r, out), "out": out, "started": r.get("started") or "", "task": r["task"],
+    base = {"run_id": run_id(r, out), "out": out.name, "out_id": out.id, "started": r.get("started") or "", "task": r["task"],
             "variant": r["variant"], "style": r.get("style") or "", "mode": r.get("mode") or "",
             "preferred": "+".join(r.get("preferred") or []), "model": r["model"],
             "served_model": r.get("served_model") or "", "rep": r.get("rep") or 1,
@@ -927,7 +950,7 @@ def append_shared(path: Path, rows: Sequence[dict[str, Any]]) -> None:
         os.close(fd)
 
 
-def sync_shared(path: Path, results: Sequence[Result], out: str) -> int:
+def sync_shared(path: Path, results: Sequence[Result], out: OutDir) -> int:
     """Add any run in this tally that the shared CSV doesn't have yet (older runs, or a new shared file)."""
     have = shared_ids(path)
     missing = [r for r in results if run_id(r, out) not in have]
@@ -1042,9 +1065,10 @@ def main() -> int:
         return 0
 
     root.mkdir(parents=True, exist_ok=True)
+    out = out_dir(root)
     harness = harness_commit()
     if shared:
-        added = sync_shared(shared, results, root.name)
+        added = sync_shared(shared, results, out)
         if added:
             print(f"added {added} earlier run(s) from {tally} to {shared}", flush=True)
     for i, (run, m, rep) in enumerate(todo, 1):
@@ -1062,7 +1086,7 @@ def main() -> int:
         write_tally(tally, results)
         if shared:
             try:
-                append_shared(shared, observations(r, root.name))
+                append_shared(shared, observations(r, out))
             except (OSError, ValueError, TypeError) as e:  # the next invocation's sync_shared backfills it
                 print(f"    warning: couldn't add this run to {shared}: {e}", file=sys.stderr, flush=True)
         done.add(key)

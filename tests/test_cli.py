@@ -56,6 +56,8 @@ def test_repeats_resume_and_shared_csv(tmp_path: Path, fake_path: str) -> None:
     with (tmp_path / "observations.csv").open(newline="") as f:
         rows = list(csv.DictReader(f))
     assert len({row["run_id"] for row in rows}) == 6
+    marker = (tmp_path / "out" / ".bakeoff-id").read_text().strip()
+    assert {(row["out"], row["out_id"]) for row in rows} == {("out", marker)}
     prompts = [row for row in rows if row["kind"] == "prompt"]
     assert len(prompts) == 6 and all(row["name"] == row["prompt_sha"] for row in prompts)
     assert "## Convergence" in (tmp_path / "out" / "report.md").read_text()

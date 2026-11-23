@@ -10,6 +10,8 @@ from conftest import make_result
 
 import agent_bakeoff as ab
 
+OUT = ab.OutDir("out", "0123456789abcdef")
+
 
 def unescape(text: str) -> str:
     return text.replace("\\\\", "\0").replace("\\n", "\n").replace("\\r", "\r").replace("\0", "\\")
@@ -37,25 +39,31 @@ def test_old_tally_rows_load_as_repeat_1(tmp_path: Path) -> None:
 
 def test_run_id_is_stable_and_distinct() -> None:
     a, b = make_result(rep=1), make_result(rep=2)
-    assert ab.run_id(a, "out") == ab.run_id(json.loads(json.dumps(a)), "out")
-    assert ab.run_id(a, "out") != ab.run_id(b, "out")
+    assert ab.run_id(a, OUT) == ab.run_id(json.loads(json.dumps(a)), OUT)
+    assert ab.run_id(a, OUT) != ab.run_id(b, OUT)
 
 
-def test_identical_old_runs_in_two_out_dirs_stay_distinct(tmp_path: Path) -> None:
-    old = {k: v for k, v in make_result().items() if k != "started"}  # tallies from before `started` existed
+def test_out_dir_id_persists_moves_and_differs(tmp_path: Path) -> None:
+    a, b = tmp_path / "m1" / "bakeoff", tmp_path / "m2" / "bakeoff"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    first = ab.out_dir(a)
+    assert first.name == "bakeoff" and ab.out_dir(a) == first
+    assert ab.out_dir(b).id != first.id  # same name, different folder
+    moved = tmp_path / "renamed"
+    a.rename(moved)
+    assert ab.out_dir(moved).id == first.id
+    assert [f.name for f in moved.iterdir()] == [".bakeoff-id"]  # no temp files left behind
+
+
+def test_identical_old_runs_in_same_named_out_dirs_stay_distinct(tmp_path: Path) -> None:
+    """Two machines both using the default `bakeoff` dir, syncing tallies from before `started` existed whose
+    rows match on every field (a Cursor run reports no API time, cost or usage)."""
+    old = {k: v for k, v in make_result().items() if k not in ("started", "api_ms", "cost_usd", "usage")}
     shared = tmp_path / "observations.csv"
-    assert ab.sync_shared(shared, [old], "bakeoff-1") == 1
-    assert ab.sync_shared(shared, [old], "bakeoff-2") == 1
-    assert ab.sync_shared(shared, [old], "bakeoff-2") == 0
-
-
-def test_old_runs_in_same_named_out_dirs_stay_distinct(tmp_path: Path) -> None:
-    """Two machines both using the default `bakeoff` dir, syncing old tallies into one shared CSV."""
-    base = {k: v for k, v in make_result().items() if k != "started"}
-    other = {**base, "api_ms": 98765, "cost_usd": 0.4321}  # same cell, repeat, wall time and status
-    shared = tmp_path / "observations.csv"
-    assert ab.sync_shared(shared, [base], "bakeoff") == 1
-    assert ab.sync_shared(shared, [other], "bakeoff") == 1
+    assert ab.sync_shared(shared, [old], ab.OutDir("bakeoff", "machine-1")) == 1
+    assert ab.sync_shared(shared, [old], ab.OutDir("bakeoff", "machine-2")) == 1
+    assert ab.sync_shared(shared, [old], ab.OutDir("bakeoff", "machine-2")) == 0
 
 
 @pytest.mark.parametrize("answer", [{"components": 42}, {"components": [{"name": "pyspark"}], "languages": 42},
@@ -63,7 +71,7 @@ def test_old_runs_in_same_named_out_dirs_stay_distinct(tmp_path: Path) -> None:
 def test_malformed_answers_are_recorded_not_fatal(tmp_path: Path, answer: dict[str, object]) -> None:
     stream = json.dumps({"type": "result", "is_error": False, "result": json.dumps(answer)})
     summary = ab.summarize(stream, tmp_path, "ask")
-    rows = ab.observations({**make_result(style="ask"), **summary}, "out")
+    rows = ab.observations({**make_result(style="ask"), **summary}, OUT)
     assert rows and {row["kind"] for row in rows} >= {"run", "prompt"}
 
 
@@ -71,7 +79,7 @@ def test_observations(tmp_path: Path) -> None:
     r = make_result(libs=("Spark", "tests"), preferred=("Spark", "Kafka"), tool_versions={"Spark": "3.5.1"})
     r["answer"] = {"components": [{"name": "Apache Spark", "version": "3.5.1", "role": "engine\nmain"}],
                    "languages": ["Python 3.12"], "rationale": "Because."}
-    rows = ab.observations(r, "bakeoff")
+    rows = ab.observations(r, OUT)
     assert all(set(row) == set(ab.SHARED_FIELDS) for row in rows)
     assert len({row["run_id"] for row in rows}) == 1
     facts = {(row["kind"], row["name"]): row for row in rows}
@@ -85,9 +93,9 @@ def test_observations(tmp_path: Path) -> None:
 def test_shared_csv_sync_is_idempotent(tmp_path: Path) -> None:
     shared = tmp_path / "data" / "observations.csv"
     results = [make_result(rep=1), make_result(rep=2)]
-    assert ab.sync_shared(shared, results, "out") == 2
-    assert ab.sync_shared(shared, results, "out") == 0
-    assert ab.sync_shared(shared, [*results, make_result(rep=3)], "out") == 1
+    assert ab.sync_shared(shared, results, OUT) == 2
+    assert ab.sync_shared(shared, results, OUT) == 0
+    assert ab.sync_shared(shared, [*results, make_result(rep=3)], OUT) == 1
     with shared.open(newline="") as f:
         rows = list(csv.DictReader(f))
     assert len({row["run_id"] for row in rows}) == 3
@@ -97,7 +105,7 @@ def test_shared_csv_sync_is_idempotent(tmp_path: Path) -> None:
 def test_failed_export_leaves_no_partial_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     shared = tmp_path / "observations.csv"
     first, second = make_result(rep=1), make_result(rep=2)
-    ab.sync_shared(shared, [first], "out")
+    ab.sync_shared(shared, [first], OUT)
     before = shared.read_bytes()
 
     def half_then_disk_full(fd: int, data: bytes) -> None:
@@ -106,16 +114,16 @@ def test_failed_export_leaves_no_partial_rows(tmp_path: Path, monkeypatch: pytes
 
     monkeypatch.setattr(ab, "_write_all", half_then_disk_full)
     with pytest.raises(OSError):
-        ab.append_shared(shared, ab.observations(second, "out"))
+        ab.append_shared(shared, ab.observations(second, OUT))
     monkeypatch.undo()
     assert shared.read_bytes() == before  # nothing of the failed run is left behind
-    assert ab.sync_shared(shared, [first, second], "out") == 1  # so the next sync adds it whole
+    assert ab.sync_shared(shared, [first, second], OUT) == 1  # so the next sync adds it whole
 
 
 def test_non_ascii_prompt_round_trips(tmp_path: Path) -> None:
     shared = tmp_path / "observations.csv"
     r = {**make_result(), "prompt": "PM2.5 above 75 µg/m³, TMAX in °C"}
-    ab.sync_shared(shared, [r], "out")
+    ab.sync_shared(shared, [r], OUT)
     with shared.open(newline="", encoding="utf-8") as f:
         [prompt] = [row for row in csv.DictReader(f) if row["kind"] == "prompt"]
     assert prompt["value"] == r["prompt"]
