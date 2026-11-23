@@ -1,6 +1,8 @@
 """The tally round trip and the shared long-format observations CSV."""
 import csv
+import errno
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -90,3 +92,30 @@ def test_shared_csv_sync_is_idempotent(tmp_path: Path) -> None:
         rows = list(csv.DictReader(f))
     assert len({row["run_id"] for row in rows}) == 3
     assert sum(1 for _ in shared.open()) == len(rows) + 1  # one physical line per row, plus the header
+
+
+def test_failed_export_leaves_no_partial_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    shared = tmp_path / "observations.csv"
+    first, second = make_result(rep=1), make_result(rep=2)
+    ab.sync_shared(shared, [first], "out")
+    before = shared.read_bytes()
+
+    def half_then_disk_full(fd: int, data: bytes) -> None:
+        os.write(fd, data[: len(data) // 2])
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ab, "_write_all", half_then_disk_full)
+    with pytest.raises(OSError):
+        ab.append_shared(shared, ab.observations(second, "out"))
+    monkeypatch.undo()
+    assert shared.read_bytes() == before  # nothing of the failed run is left behind
+    assert ab.sync_shared(shared, [first, second], "out") == 1  # so the next sync adds it whole
+
+
+def test_non_ascii_prompt_round_trips(tmp_path: Path) -> None:
+    shared = tmp_path / "observations.csv"
+    r = {**make_result(), "prompt": "PM2.5 above 75 µg/m³, TMAX in °C"}
+    ab.sync_shared(shared, [r], "out")
+    with shared.open(newline="", encoding="utf-8") as f:
+        [prompt] = [row for row in csv.DictReader(f) if row["kind"] == "prompt"]
+    assert prompt["value"] == r["prompt"]

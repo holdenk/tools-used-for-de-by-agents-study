@@ -25,6 +25,7 @@ import argparse
 import collections
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -890,23 +891,40 @@ def observations(r: Result, out: str) -> list[dict[str, Any]]:
 def shared_ids(path: Path) -> set[str]:
     if not path.exists():
         return set()
-    with path.open(newline="") as f:
+    with path.open(newline="", encoding="utf-8") as f:
         return {row["run_id"] for row in csv.DictReader(f)}
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
 def append_shared(path: Path, rows: Sequence[dict[str, Any]]) -> None:
-    """Append under an exclusive lock, so several bakeoffs can share one file."""
+    """Append one run's rows all or nothing, under an exclusive lock so several bakeoffs can share one file.
+    If the write fails partway (a full disk, say), the file is cut back to where it was, so no run is ever half
+    exported: shared_ids would see its id and sync_shared would never add the missing rows."""
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", newline="") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
         if sys.platform != "win32":
-            fcntl.flock(f, fcntl.LOCK_EX)
-        w = csv.DictWriter(f, fieldnames=SHARED_FIELDS)
-        if os.fstat(f.fileno()).st_size == 0:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        start = os.fstat(fd).st_size
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=SHARED_FIELDS)
+        if start == 0:
             w.writeheader()
         w.writerows(rows)
-        f.flush()
+        try:
+            _write_all(fd, buf.getvalue().encode("utf-8"))
+        except BaseException:
+            os.ftruncate(fd, start)
+            raise
+    finally:
+        os.close(fd)
 
 
 def sync_shared(path: Path, results: Sequence[Result], out: str) -> int:
