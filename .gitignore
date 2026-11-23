@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Shared bakeoff observations (agent_bakeoff.py --shared-csv); kept out of git
+data/observations.csv
