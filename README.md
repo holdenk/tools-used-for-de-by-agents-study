@@ -6,7 +6,7 @@ against every Cursor model (`agent --list-models`), then Cortex Code and Claude 
 Each run gets a fresh directory, and the script records the languages, libraries,
 pinned versions and agent tools each one used.
 
-| task | prompt | default preferred tools |
+| task | prompt | stack we name in prefer mode |
 |---|---|---|
 | `poi_s2` | Convert all of the Mapbox POI data into S2 bounding-box coverings on a cluster | Spark |
 | `hourly_data_quality` | An hourly job that flags data quality issues in an `orders` event table | Spark, Airflow |
