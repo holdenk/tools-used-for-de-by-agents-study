@@ -33,12 +33,21 @@ import shutil
 import subprocess
 import sys
 import time
-
-try:
-    import fcntl  # lock the shared CSV while appending; not on Windows
-except ImportError:
-    fcntl = None
+from collections import Counter
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
+from typing import Any, TypeVar
+
+if sys.platform != "win32":
+    import fcntl  # lock the shared CSV while appending
+
+Result = dict[str, Any]  # one finished run: what run_one returns, a tally row, a results.json entry
+Run = dict[str, Any]  # one planned (task, style, mode) run, from plan_runs
+Group = tuple[str, str]  # (task, variant)
+Task = tuple[list[str], str, str]  # (preferred tools, prompt body, template sha)
+# what an ask answer says: (languages, libraries, tool versions, pins, language versions)
+AnswerFacts = tuple[dict[str, int | None], list[str], dict[str, str], dict[str, str], dict[str, str]]
+T = TypeVar("T")
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 LEGACY = "legacy"  # tally/results rows from before modes existed (old POI prompt: "Spark preferred")
@@ -69,9 +78,9 @@ version you would target). Reply with only a JSON object shaped like:
 """
 
 
-def parse_prompt(text):
+def parse_prompt(text: str) -> tuple[list[str], str]:
     """-> (prefer list, body). Front matter is a leading ---/--- block of `key: value` lines."""
-    prefer = []
+    prefer: list[str] = []
     m = re.match(r"---\n(.*?)\n---\n", text, re.S)
     if m:
         text = text[m.end():]
@@ -82,7 +91,7 @@ def parse_prompt(text):
     return prefer, text
 
 
-def load_tasks(spec, prompts_dir):
+def load_tasks(spec: str | None, prompts_dir: Path) -> dict[str, Task]:
     """task name -> (prefer, body, template sha). spec: comma list of task names or prompt file paths; default every
     prompts/*.md. The sha (of the whole file, front matter included) says which version of the task prompt ran."""
     if spec:
@@ -95,28 +104,28 @@ def load_tasks(spec, prompts_dir):
     return {f.stem: (*parse_prompt(f.read_text()), sha(f.read_text())) for f in files}
 
 
-def sha(text):
+def sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
-def join_tools(tools):
+def join_tools(tools: Sequence[str]) -> str:
     return ", ".join(tools[:-1]) + " and " + tools[-1] if len(tools) > 1 else "".join(tools)
 
 
-def render(body, mode, tools):
+def render(body: str, mode: str, tools: Sequence[str]) -> str:
     line = TOOLING[mode].replace("{tools}", join_tools(tools))
     if "{tooling}" in body:
         return body.replace("{tooling}", line)
     return body.rstrip("\n") + "\n" + line + "\n"
 
 
-def variant_name(style, mode, tools):
+def variant_name(style: str, mode: str, tools: Sequence[str]) -> str:
     v = "float" if mode == "float" else \
         "prefer-" + "+".join(re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-") for t in tools)
     return "ask-" + v if style == "ask" else v
 
 
-def list_models():
+def list_models() -> list[str]:
     if not shutil.which("agent"):
         print("warning: Cursor `agent` CLI not on PATH; running only the non-Cursor extras", file=sys.stderr)
         return []
@@ -129,11 +138,11 @@ def list_models():
 EXTRAS = ("cortex", "claude")
 
 
-def is_extra(spec):
+def is_extra(spec: str) -> bool:
     return spec.partition(":")[0] in EXTRAS
 
 
-def extra_cmd(spec, prompt):
+def extra_cmd(spec: str, prompt: str) -> list[str]:
     name, _, model = spec.partition(":")
     if name == "claude":
         return ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose",
@@ -230,7 +239,7 @@ GIT_PINS = [  # each yields (name, git tag or commit): an exact pin, even in Car
 ]
 
 
-def _spec(v, cargo=False):
+def _spec(v: str, cargo: bool = False) -> str:
     """Normalize a version spec so only an exact pin is shown as a bare version.
 
     '==3.5.1' -> '3.5.1'; '>= 3.5.1, <4' -> '>=3.5.1,<4'; '==3.5.*' stays (a wildcard is a range);
@@ -264,12 +273,12 @@ VERSION_ALIASES = {
 }
 
 
-def project_files(workdir):
+def project_files(workdir: Path) -> list[Path]:
     return [f for f in workdir.rglob("*") if f.is_file() and not SKIP & set(f.relative_to(workdir).parts)]
 
 
-def pinned_versions(workdir):
-    pins = {}
+def pinned_versions(workdir: Path) -> dict[str, str]:
+    pins: dict[str, str] = {}
     for f in project_files(workdir):
         if f.name in DEP_FILES:
             text = f.read_text(errors="ignore")
@@ -291,7 +300,7 @@ def pinned_versions(workdir):
     return {k: v for k, v in pins.items() if not v.startswith("$")}
 
 
-def docs_text(workdir):
+def docs_text(workdir: Path) -> str:
     """Dependency files plus free-form places versions get written down (README, Dockerfile, submit scripts)."""
     return "\n".join(f.read_text(errors="ignore") for f in project_files(workdir)
                      if f.name in DEP_FILES or f.name == "Dockerfile"
@@ -310,7 +319,7 @@ SPARK_VERSION_RX = [  # first hit wins; Python, then Scala/Java, then free-form 
 ]
 
 
-def spark_version(text, pins=None):
+def spark_version(text: str, pins: dict[str, str] | None = None) -> str | None:
     if pins and pins.get("pyspark"):  # a parsed dependency pin beats any pattern over prose
         return pins["pyspark"]
     for rx in SPARK_VERSION_RX:
@@ -324,13 +333,13 @@ def spark_version(text, pins=None):
     return None
 
 
-def _norm(name):
+def _norm(name: str) -> str:
     """'org.apache.flink:flink-streaming-java_2.12' -> 'flinkstreamingjava'"""
     name = name.lower().split(":")[-1]
     return re.sub(r"[^a-z0-9]", "", re.sub(r"_2\.\d+$", "", name))
 
 
-def tool_version(label, pins, docs, spark_v):
+def tool_version(label: str, pins: dict[str, str], docs: str, spark_v: str | None) -> str | None:
     """Best guess at the version an agent used for a LIBS label: dependency pins first, then prose."""
     if label in ("Spark", "Spark Structured Streaming"):
         return spark_v
@@ -346,8 +355,9 @@ def tool_version(label, pins, docs, spark_v):
     return None
 
 
-def inspect_project(workdir):
-    langs, libs = collections.Counter(), set()
+def inspect_project(workdir: Path) -> tuple[dict[str, int], list[str]]:
+    langs: Counter[str] = Counter()
+    libs: set[str] = set()
     for f in project_files(workdir):
         lang = LANGS.get(f.suffix.lower())
         try:
@@ -361,7 +371,7 @@ def inspect_project(workdir):
     return dict(langs.most_common()), sorted(libs)
 
 
-def parse_answer(text):
+def parse_answer(text: str) -> dict[str, Any] | None:
     """The JSON object from an ask-style final message (bare, or in a ```json fence), or None."""
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
     candidates = [fence.group(1)] if fence else []
@@ -381,37 +391,37 @@ LANG_ALIASES = {**{v.lower(): v for v in LANGS.values()}, "bash": "Shell", "sh":
                 "pyspark": "Python", "javascript": "JS", "typescript": "TS", "golang": "Go"}
 
 
-def language_name(text):
+def language_name(text: str) -> str:
     """'Java 17 (Eclipse Temurin)' -> 'Java'; 'Bash scripts' -> 'Shell'; 'Spark SQL' -> 'Spark SQL';
     unknown -> its first word."""
     if re.match(r"\s*spark\s*sql", text, re.I):
         return "Spark SQL"
     if re.match(r"\s*(hive|ansi)\s*sql", text, re.I):
         return "SQL"
-    word = (re.findall(r"[A-Za-z][\w+#]*", text) or [text])[0]
+    word: str = (re.findall(r"[A-Za-z][\w+#]*", text) or [text])[0]
     return LANG_ALIASES.get(word.lower(), word)
 
 
-def valid_answer(ans):
+def valid_answer(ans: object) -> bool:
     """An ask answer counts as an observation only if every component is an object with a name."""
     comps = ans.get("components") if isinstance(ans, dict) else None
     return (isinstance(comps, list) and bool(comps)
             and all(isinstance(c, dict) and isinstance(c.get("name"), str) and c["name"].strip() for c in comps))
 
 
-def split_component(c):
+def split_component(c: dict[str, Any]) -> list[dict[str, Any]]:
     """'BeautifulSoup4 + lxml' at '4.12.3 / 5.3.0' -> one component each, when names and versions pair up 1:1."""
     # separators inside "(...)" describe parts of one library ("Ray (core + Ray Data)"), so don't split there
     names = re.split(r"\s+(?:\+|/|and)\s+(?![^()]*\))", str(c["name"]))
     vers = re.split(r"\s*/\s*|\s*;\s*", str(c.get("version") or ""))
     if len(names) > 1 and len(names) == len(vers):
-        return [{**c, "name": n, "version": v} for n, v in zip(names, vers)]
+        return [{**c, "name": n, "version": v} for n, v in zip(names, vers, strict=True)]
     if len(names) > 1:  # several libraries, versions that don't pair up: keep the libraries, drop the versions
         return [{**c, "name": n, "version": ""} for n in names]
     return [c]
 
 
-def answer_version(text):
+def answer_version(text: object) -> str | None:
     """A version from an ask answer -> normalized spec, or None. The whole string must be one spec plus an
     optional "(note)"; "3.5.1 || 4.0.0", prose, or a note naming an alternative ("3.5.1 (or 4.0.0)") stays None."""
     ver = re.fullmatch(rf"({SPEC})(?:\s*\(([^)]*)\))?", str(text or "").strip())
@@ -420,11 +430,13 @@ def answer_version(text):
     return _spec(ver.group(1))
 
 
-def answer_languages(entries):
+def answer_languages(entries: Iterable[object] | None) -> tuple[dict[str, int | None], dict[str, str], list[str]]:
     """({language: None}, {language: version}, [text per entry]) from an ask answer's `languages`.
     Entries are {"name", "version"} objects, or bare strings like "Scala 2.13" (answers from before the
     trailer asked for language versions, or models that ignore the shape)."""
-    langs, versions, texts = {}, {}, []
+    langs: dict[str, int | None] = {}  # same shape as build style's {language: LOC}; an answer has no LOC
+    versions: dict[str, str] = {}
+    texts: list[str] = []
     for entry in entries or []:
         if isinstance(entry, dict):
             name, ver = str(entry.get("name") or ""), answer_version(entry.get("version"))
@@ -444,7 +456,7 @@ def answer_languages(entries):
     return langs, versions, texts
 
 
-def inspect_answer(ans):
+def inspect_answer(ans: dict[str, Any]) -> AnswerFacts:
     """(languages, libraries, tool_versions, pins, language_versions) from an ask-style answer,
     using the same LIBS labels."""
     comps = [c for c in ans.get("components") or [] if isinstance(c, dict) and c.get("name")]
@@ -467,14 +479,16 @@ def inspect_answer(ans):
     # "Spark SQL", "SQL (Spark SQL)" or "Java (runtime for Spark)" as a language still means the stack uses Spark
     if any(re.search(r"\bspark\b", t, re.I) for t in lang_texts):
         libs.add("Spark")
-    libs = sorted(libs)
     pins = {str(c["name"]).lower(): str(c["version"]) for c in comps if c.get("version")}
-    return langs, libs, tool_versions, pins, lang_versions
+    return langs, sorted(libs), tool_versions, pins, lang_versions
 
 
-def summarize(stream, workdir, style="build"):
+def summarize(stream: str, workdir: Path, style: str = "build") -> Result:
     """Cursor: `started` tool_call events (key = tool). Others: tool_use blocks."""
-    tools, shell_cmds, result, served = collections.Counter(), [], {}, None
+    tools: Counter[str] = Counter()
+    shell_cmds: list[str] = []
+    result: dict[str, Any] = {}
+    served: str | None = None
     for line in stream.splitlines():
         try:
             ev = json.loads(line)
@@ -497,13 +511,17 @@ def summarize(stream, workdir, style="build"):
         elif ev.get("type") == "result":
             result = ev
     answer, invalid = None, False
+    langs: dict[str, int | None]
+    lang_versions: dict[str, str]
     if style == "ask":
         answer = parse_answer(result.get("result") or "")
-        invalid = not valid_answer(answer)
-        langs, libs, tool_versions, pins, lang_versions = ({}, [], {}, {}, {}) if invalid else inspect_answer(answer)
+        invalid = answer is None or not valid_answer(answer)
+        langs, libs, tool_versions, pins, lang_versions = (
+            inspect_answer(answer) if answer is not None and not invalid else ({}, [], {}, {}, {}))
         spark_v = tool_versions.get("Spark")
     else:
-        langs, libs = inspect_project(workdir)
+        loc, libs = inspect_project(workdir)
+        langs = dict(loc)
         lang_versions = {}  # build style doesn't detect language versions yet
         pins, docs = pinned_versions(workdir), docs_text(workdir)
         spark_v = spark_version(docs, pins) if "Spark" in libs else None
@@ -529,12 +547,12 @@ def summarize(stream, workdir, style="build"):
     }
 
 
-def run_dir_name(model, rep):
+def run_dir_name(model: str, rep: int) -> str:
     """Repeat 1 keeps the plain model name, so tallies and dirs from before --repeats line up."""
     return re.sub(r"[^\w.\-]", "_", model) + ("" if rep == 1 else f".rep{rep}")
 
 
-def run_one(run, model, root, timeout, rep=1):
+def run_one(run: Run, model: str, root: Path, timeout: int, rep: int = 1) -> Result:
     wd = root / run["task"] / run["variant"] / run_dir_name(model, rep)
     shutil.rmtree(wd, ignore_errors=True)  # partial dir from a crashed run
     wd.mkdir(parents=True)
@@ -548,7 +566,7 @@ def run_one(run, model, root, timeout, rep=1):
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0))  # for version lag vs releases at run time
     try:
         p = subprocess.run(cmd, cwd=wd, capture_output=True, text=True, timeout=timeout)
-        stream, err, status = p.stdout, p.stderr, "exit %d" % p.returncode
+        stream, err, status = p.stdout, p.stderr, f"exit {p.returncode}"
     except subprocess.TimeoutExpired as e:
         stream = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         err, status = "", "TIMEOUT"
@@ -564,20 +582,20 @@ def run_one(run, model, root, timeout, rep=1):
             **summary, "stderr": err[-400:]}
 
 
-def language_label(r, lang):
+def language_label(r: Result, lang: str) -> str:
     """'Scala 2.13' when the run gave a language version, else just 'Scala'."""
     ver = (r.get("language_versions") or {}).get(lang)
     return f"{lang} {ver}" if ver else lang
 
 
-def primary_language(r):
+def primary_language(r: Result) -> str:
     if r.get("invalid_answer"):
         return "INVALID ANSWER"
     lang = next(iter(r["languages"]), None)
     return language_label(r, lang) if lang else "-"
 
 
-def preferred_cell(r):
+def preferred_cell(r: Result) -> str:
     """'Spark 3.5.1, Kafka unpinned' / 'vLLM NOT USED' for a prefer-mode run."""
     if r.get("invalid_answer"):
         return "INVALID ANSWER"
@@ -585,7 +603,8 @@ def preferred_cell(r):
                      for t in r["preferred"]) or "-"
 
 
-def pivot(rows, cols, header, cell):
+def pivot(rows: Sequence[str], cols: Sequence[Group], header: Callable[[Group], str],
+          cell: Callable[[Group, str], str]) -> list[str]:
     """Markdown table: one row per model, one column per (task, variant)."""
     lines = ["| model | " + " | ".join(header(c) for c in cols) + " |", "|---" * (len(cols) + 1) + "|"]
     for m in rows:
@@ -593,16 +612,16 @@ def pivot(rows, cols, header, cell):
     return lines
 
 
-def col(g, rs):
+def col(g: Group, rs: Sequence[Result]) -> str:
     return g[0] + (" [ask]" if rs[0].get("style") == "ask" else "")
 
 
-def run_label(r):
+def run_label(r: Result) -> str:
     rep = r.get("rep") or 1
-    return r["model"] + ("" if rep == 1 else f" #{rep}")
+    return str(r["model"]) + ("" if rep == 1 else f" #{rep}")
 
 
-def tally_cell(values):
+def tally_cell(values: Sequence[str]) -> str:
     """One repeat: its value. Several: 'Spark 3.5.1 ×3; Spark 4.0.0 ×1', most common first."""
     if len(values) == 1:
         return values[0]
@@ -614,33 +633,34 @@ def tally_cell(values):
 NOT_A_CHOICE = {"tests"}  # every prompt asks for tests, so this label says nothing about the stack
 
 
-def stack(r):
+def stack(r: Result) -> frozenset[str]:
     return frozenset(r["libraries"]) - NOT_A_CHOICE
 
 
-def jaccard(a, b):
+def jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / len(a | b) if a | b else 1.0
 
 
-def mean_similarity(runs, same_model):
+def mean_similarity(runs: Sequence[Result], same_model: bool) -> str:
     """Mean pairwise Jaccard of library sets, over pairs from the same model (repeats) or from different models."""
     sims = [jaccard(stack(x), stack(y)) for i, x in enumerate(runs) for y in runs[i + 1:]
             if (x["model"] == y["model"]) == same_model]
     return f"{sum(sims) / len(sims):.2f}" if sims else "-"
 
 
-def effective_choices(counter):
+def effective_choices(counter: Counter[Any]) -> float:
     """2^entropy: 1.0 when every run made the same choice, n when n choices were equally common."""
     n = sum(counter.values())
     return 2 ** -sum(c / n * math.log2(c / n) for c in counter.values()) if n else 0.0
 
 
-def modal(counter):
+def modal(counter: Counter[T]) -> tuple[T, str]:
     value, count = counter.most_common(1)[0]
     return value, f"{count}/{sum(counter.values())}"
 
 
-def convergence(groups, by_group, valid):
+def convergence(groups: Sequence[Group], by_group: dict[Group, list[Result]],
+                valid: dict[Group, list[Result]]) -> list[str]:
     lines = ["## Convergence: how often runs land on the same stack", "",
              "Over valid runs, ignoring the `tests` label. **Top stack**: the most common exact library set. "
              "**Effective stacks**: 2^entropy of the library-set distribution (1 = every run picked the same "
@@ -666,23 +686,27 @@ def convergence(groups, by_group, valid):
                     and by_group[g][0].get("style", "build") == style and valid[g]]
         if len(floating) < 2:
             continue
-        share = lambda lib, g: sum(lib in stack(r) for r in valid[g]) / len(valid[g])
         libs = {lib for g in floating for r in valid[g] for lib in stack(r)}
-        core = sorted(lib for lib in libs if all(share(lib, g) >= 0.5 for g in floating))
+        core = sorted(lib for lib in libs
+                      if all(sum(lib in stack(r) for r in valid[g]) >= len(valid[g]) / 2 for g in floating))
         lines += ["", f"Used by at least half the float runs of every task ({style}, {len(floating)} tasks): "
                       + (", ".join(core) or "none")]
     return lines + [""]
 
 
-def report(results):
+def report(results: Sequence[Result]) -> str:
     groups = list(dict.fromkeys((r["task"], r["variant"]) for r in results))
     by_group = {g: [r for r in results if (r["task"], r["variant"]) == g] for g in groups}
     valid = {g: [r for r in rs if not r.get("invalid_answer")] for g, rs in by_group.items()}  # stats skip these
     models = list(dict.fromkeys(r["model"] for r in results))
-    cells = collections.defaultdict(list)  # (task, variant, model) -> its runs, one per repeat
+    cells: dict[tuple[str, str, str], list[Result]] = collections.defaultdict(list)  # one run per repeat
     for r in sorted(results, key=lambda r: r.get("rep") or 1):
         cells[(r["task"], r["variant"], r["model"])].append(r)
-    shown = lambda g, m, fn: tally_cell([fn(r) for r in cells[(*g, m)]]) if cells.get((*g, m)) else ""
+
+    def shown(g: Group, m: str, fn: Callable[[Result], str]) -> str:
+        runs = cells.get((*g, m))
+        return tally_cell([fn(r) for r in runs]) if runs else ""
+
     lines = ["# Agent DE bakeoff", "", f"tasks: {', '.join(dict.fromkeys(t for t, _ in groups))}", ""]
 
     prefer = [g for g in groups if by_group[g][0]["mode"] == "prefer"]
@@ -693,7 +717,7 @@ def report(results):
                   "(ask style) means the reply had no usable JSON; those runs are left out of the counts.", ""]
         lines += pivot(models, prefer, lambda g: f"{col(g, by_group[g])} ({', '.join(by_group[g][0]['preferred'])})",
                        lambda g, m: shown(g, m, preferred_cell))
-        spread = collections.defaultdict(collections.Counter)
+        spread: dict[str, Counter[str]] = collections.defaultdict(Counter)
         for g in prefer:
             for r in valid[g]:
                 for t in r["preferred"]:
@@ -707,7 +731,7 @@ def report(results):
         lines += ["## Float mode: primary language", ""]
         lines += pivot(models, floating, lambda g: col(g, by_group[g]), lambda g, m: shown(g, m, primary_language))
         counts = {g: collections.Counter(lib for r in valid[g] for lib in r["libraries"]) for g in floating}
-        libs = sorted({lib for c in counts.values() for lib in c}, key=lambda l: -sum(c[l] for c in counts.values()))
+        libs = sorted({lib for c in counts.values() for lib in c}, key=lambda lib: -sum(c[lib] for c in counts.values()))
         lines += ["", "## Float mode: library use by task (runs using it / runs)", "",
                   "| library | " + " | ".join(col(g, by_group[g]) for g in floating) + " |", "|---" * (len(floating) + 1) + "|"]
         for lib in libs:
@@ -751,7 +775,7 @@ def report(results):
 PLAIN = ("task", "variant", "style", "mode", "model", "status")  # every other column is JSON-encoded
 
 
-def load_tally(path):
+def load_tally(path: Path) -> list[Result]:
     if not path.exists():
         return []
     with path.open(newline="") as f:
@@ -769,7 +793,7 @@ def load_tally(path):
     return rows
 
 
-def write_tally(path, results):
+def write_tally(path: Path, results: Sequence[Result]) -> None:
     """Rewrite the whole tally (it's small) so a column added later never misaligns old rows."""
     fields = list(dict.fromkeys(k for r in results for k in r))
     tmp = path.with_name(path.name + ".tmp")
@@ -788,20 +812,20 @@ SHARED_FIELDS = ["run_id", "out", "started", "task", "variant", "style", "mode",
                  "invalid_answer", "kind", "name", "version", "value"]
 
 
-def run_id(r):
+def run_id(r: Result) -> str:
     """Stable for a finished run (tally rows sync to the same id), unique across --out dirs and repeats."""
     key = [r["task"], r["variant"], r.get("style"), r["model"], r.get("rep") or 1, r.get("started") or "",
            r.get("wall_s"), r.get("status")]
     return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
 
 
-def one_line(v, cap=None):
+def one_line(v: object, cap: int | None = None) -> str:
     """CSV-safe scalar: no raw newlines, so every observation is one physical line for any CSV reader."""
     text = "" if v is None else str(v).replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
     return text[:cap] if cap else text
 
 
-def observations(r, out):
+def observations(r: Result, out: str) -> list[dict[str, Any]]:
     """One row per fact about a run: kind = run | usage | language | library | preferred | pin | agent_tool |
     shell_command | answer_component | answer_language | rationale | prompt."""
     base = {"run_id": run_id(r), "out": out, "started": r.get("started") or "", "task": r["task"],
@@ -813,7 +837,7 @@ def observations(r, out):
             "ok": int(bool(r.get("ok"))), "invalid_answer": int(bool(r.get("invalid_answer")))}
     rows = []
 
-    def add(kind, name="", version="", value="", cap=2000):
+    def add(kind: str, name: object = "", version: object = "", value: object = "", cap: int | None = 2000) -> None:
         rows.append({**base, "kind": kind, "name": one_line(name, 300), "version": one_line(version, 300),
                      "value": one_line(value, cap)})
 
@@ -850,20 +874,20 @@ def observations(r, out):
     return rows
 
 
-def shared_ids(path):
+def shared_ids(path: Path) -> set[str]:
     if not path.exists():
         return set()
     with path.open(newline="") as f:
         return {row["run_id"] for row in csv.DictReader(f)}
 
 
-def append_shared(path, rows):
+def append_shared(path: Path, rows: Sequence[dict[str, Any]]) -> None:
     """Append under an exclusive lock, so several bakeoffs can share one file."""
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", newline="") as f:
-        if fcntl:
+        if sys.platform != "win32":
             fcntl.flock(f, fcntl.LOCK_EX)
         w = csv.DictWriter(f, fieldnames=SHARED_FIELDS)
         if os.fstat(f.fileno()).st_size == 0:
@@ -872,7 +896,7 @@ def append_shared(path, rows):
         f.flush()
 
 
-def sync_shared(path, results, out):
+def sync_shared(path: Path, results: Sequence[Result], out: str) -> int:
     """Add any run in this tally that the shared CSV doesn't have yet (older runs, or a new shared file)."""
     have = shared_ids(path)
     missing = [r for r in results if run_id(r) not in have]
@@ -880,7 +904,7 @@ def sync_shared(path, results, out):
     return len(missing)
 
 
-def harness_commit():
+def harness_commit() -> str:
     """Git commit of this script + prompts, with -dirty if either has uncommitted changes."""
     here = str(Path(__file__).resolve().parent)
     try:
@@ -893,14 +917,15 @@ def harness_commit():
     return head + ("-dirty" if dirty else "")
 
 
-def canonical(tool):
+def canonical(tool: str) -> str:
     label = LABELS.get(tool.lower())
     if not label:
         print(f"warning: {tool!r} isn't a LIBS label, so the report can't tell whether it was used", file=sys.stderr)
     return label or tool
 
 
-def plan_runs(tasks, styles, modes, prefer_override):
+def plan_runs(tasks: dict[str, Task], styles: Sequence[str], modes: Sequence[str],
+              prefer_override: list[str] | None) -> list[Run]:
     runs = []
     for task, (prefer, body, template_sha) in tasks.items():
         tools = prefer_override or [canonical(t) for t in prefer]
@@ -923,7 +948,7 @@ def plan_runs(tasks, styles, modes, prefer_override):
     return runs
 
 
-def main():
+def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="bakeoff",
                     help="run root; each run gets a fresh <out>/<task>/<variant>/<model>. Rerun with the same dir to resume")

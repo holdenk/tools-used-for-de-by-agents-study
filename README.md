@@ -244,6 +244,21 @@ It pairs runs by (task, variant, model, repeat). In prefer mode it compares the
 preferred tools' versions; in float mode it compares primary language, Spark
 version and library set.
 
+## Development
+
+Both scripts are fully type-annotated and checked with `mypy --strict`. CI
+(`.github/workflows/ci.yml`) runs ruff and mypy, then pytest on Python 3.11 to
+3.13, plus a dry-run smoke test of the CLI. The tests don't call real agents: the
+end-to-end test puts a fake `claude` on `PATH`. To run the same checks locally:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+```bash
+ruff check . && mypy && pytest -q
+```
+
 ## References
 
 - Sil Hamilton and David Mimno. 2026. *Elias in the Lighthouse, Again? Diagnosing

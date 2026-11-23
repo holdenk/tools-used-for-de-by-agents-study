@@ -1,0 +1,18 @@
+# Tool settings only: this repo is two scripts, not an installable package.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = ["E501"]  # the LIBS / PINS regex tables read better unwrapped
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["agent_bakeoff.py", "compare_runs.py", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
