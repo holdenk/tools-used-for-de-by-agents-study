@@ -130,7 +130,7 @@ in the shared CSV below. Runs from before this existed have empty hashes.
 ## Shared observations CSV
 
 Every finished run is also appended to one long-format CSV shared by all `--out`
-directories, for analytics across many bakeoffs: `data/observations.csv` by
+directories, for analytics across many bakeoffs: `data/observations.csv` (gitignored) by
 default, or `$BAKEOFF_SHARED_CSV` or `--shared-csv PATH` (`--shared-csv ''` turns it
 off). Each run also syncs its `--out` tally into it, so runs from before the shared
 CSV existed get added, once. Appends take a file lock, so parallel bakeoffs can
