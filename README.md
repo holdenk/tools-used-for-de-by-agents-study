@@ -240,6 +240,38 @@ python3 agent_bakeoff.py --out bakeoff-ask --style ask --mode float --repeats 20
   Tallies from before tasks and modes existed load as `poi_s2 / legacy` (the old
   "Spark preferred" POI prompt).
 
+### Running out of quota
+
+When an agent CLI stops because its account is out of quota (a usage limit, a rate
+limit, no credits left, or an AI gateway's usage cap), the run isn't recorded. It stays out of `tally.csv`, the
+report and the shared CSV, so a rerun with the same `--out` does it again. The
+bakeoff logs the error with a timestamp, pauses 24 hours (`--quota-wait HOURS`), then
+retries the same run. It does this up to 10 times (`--quota-retries N`; `0` stops at
+the first quota error), and a run that gets through resets the count. If the quota
+still hasn't come back, it stops with exit code 75 and says how many runs are left.
+Rerun with the same `--out` to pick them up, or leave the exhausted model out with
+`--models` or `--match`. The pause holds up every model, not just the one that ran
+out.
+
+Only the CLI's own errors count: stderr, non-JSON stdout, an error `result` event, and
+Claude Code's `rate_limit` / `billing_error` on the message it stops with. Only a run
+that failed is checked, and the agent's own messages never are, so a fraud pipeline
+that adds a rate limiter doesn't trigger a pause. The quota-stopped run's stream stays
+in `<model>.stream.jsonl` until the retry overwrites it. Runs recorded before this
+check existed stay in the tally as failures.
+
+### Blocked access
+
+A run whose access is blocked isn't recorded either: an AI gateway or org policy that
+blocks the model or key ("Your access to this AI Gateway is blocked by your
+organization's policy", "not allowed by …", a 403), or a failed login (Claude Code's
+`authentication_failed`, "Not logged in", an invalid API key, a 401). Waiting won't fix
+those, so there's no pause: the bakeoff logs `ACCESS BLOCKED` and goes on to the next
+run. At the end it lists the blocked runs per model and exits with code 77. Fix
+access, then rerun with the same `--out` to pick them up. A block that gives quota as
+its reason ("blocked as you have exceeded the usage …") counts as out of quota, and
+gets the pause and retries.
+
 Compare two runs (e.g. to see how stable a model's choices are):
 
 ```bash
