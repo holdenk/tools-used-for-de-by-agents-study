@@ -39,7 +39,8 @@ Both modes ask the agent to pin dependency versions.
   what the agent actually does.
 - **ask** (`--style ask`): much cheaper. The agent gets the same task prompt, plus a
   trailer telling it not to write anything and to reply with only JSON
-  (`languages`, `components: [{name, version, role}]`, `rationale`). That answer
+  (`languages: [{name, version}]`, `components: [{name, version, role}]`,
+  `rationale`), with an exact version for every language and component. That answer
   goes through the same library and version detection, under an `ask-` variant
   (`ask-float`, `ask-prefer-spark+kafka`). The report marks those columns `[ask]`.
   What an agent says it would use and what it ends up using can differ, so
