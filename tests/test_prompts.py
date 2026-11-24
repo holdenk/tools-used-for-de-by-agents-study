@@ -27,6 +27,8 @@ def test_plan_runs_hashes() -> None:
     assert len({r["prompt_sha"] for r in runs}) == 4  # each variant's exact text differs
     assert len({r["template_sha"] for r in runs}) == 1
     assert all(r["prompt_sha"] == ab.sha(r["prompt"]) for r in runs)
+    # ask style lists what the agent picks, not what its picks pull in
+    assert all(("transitive" in r["prompt"]) == (r["style"] == "ask") for r in runs)
 
 
 def test_tpch_pair_differs_only_in_input_and_scale() -> None:
